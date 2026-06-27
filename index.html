@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+
+    <!-- Mobile viewport: makes the page size to the device width and stops
+         users from pinch-zooming, which keeps the game canvas full-screen. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+
+    <title>Kart Racer</title>
+
+    <!-- Inline SVG favicon as a data: URI (a small checkered-flag glyph).
+         Embedding it here means the browser does NOT make a separate /favicon.ico
+         request, which removes the 404 that was showing in the console. No
+         external file needed. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23fff'/%3E%3Crect width='4' height='4' fill='%23000'/%3E%3Crect x='8' width='4' height='4' fill='%23000'/%3E%3Crect x='4' y='4' width='4' height='4' fill='%23000'/%3E%3Crect x='12' y='4' width='4' height='4' fill='%23000'/%3E%3Crect y='8' width='4' height='4' fill='%23000'/%3E%3Crect x='8' y='8' width='4' height='4' fill='%23000'/%3E%3Crect x='4' y='12' width='4' height='4' fill='%23000'/%3E%3Crect x='12' y='12' width='4' height='4' fill='%23000'/%3E%3C/svg%3E"
+    />
+
+    <!-- Our base styles. ui.css also imports Tailwind on its first line. -->
+    <link rel="stylesheet" href="/src/ui/ui.css" />
+  </head>
+
+  <body>
+    <!-- HUD overlay container.
+         The 3D renderer appends its own <canvas> to <body> at runtime, so we
+         do NOT put a canvas here. This div sits on top of that canvas and holds
+         all heads-up display elements (speed, lap counter, item box, etc.).
+         It uses pointer-events:none (see ui.css) so clicks pass through to the
+         game underneath. -->
+    <div id="hud"></div>
+
+    <!-- The game entry point. type="module" lets us use ES module imports.
+         main.js is created by the core module and boots the whole game. -->
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,2 @@
+3D kart models: Kenney "Car Kit" (v3.1), CC0 / public domain (https://kenney.nl/assets/car-kit).
+kart.glb=kart-oopi, kart-alt1=kart-ooli, kart-alt2=kart-oozi, kart-future=race-future, kart-race=race.

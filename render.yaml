@@ -1,0 +1,19 @@
+# render.yaml — Render Blueprint for the kart racing game.
+#
+# Push this repo to GitHub, then on Render: New > Blueprint, point it at the
+# repo, and Render reads this file to provision the service automatically.
+#
+# Single service: a Node web service that builds the Vite client and runs the
+# Express + Socket.IO server, which serves ./dist statically AND handles the
+# websocket on the SAME origin/port. Render injects PORT; the server reads it
+# via process.env.PORT. No extra config needed.
+services:
+  - type: web
+    name: kart-racer
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production

@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Build output (CI builds this; never commit it)
+dist/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor cruft
+.DS_Store
+*.swp
+
+# Tooling / local-only artifacts
+.playwright-mcp/
+graphify-out/
+.vite/
+
+# Local test screenshots (not part of the game)
+*.jpeg
+*.jpg
+*.png

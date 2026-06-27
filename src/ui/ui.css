@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+/* Base styles for the Kart Racer game.
+   These run on top of Tailwind and set up the full-screen game layout. */
+
+/* Remove default page margins, fill the whole window, and hide scrollbars
+   so the 3D canvas can be true full-screen. The dark background (#0b1020)
+   shows for a moment before the renderer paints the first frame. */
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #0b1020;
+}
+
+/* The renderer appends its <canvas> to <body>. `display: block` removes the
+   small gap browsers add below inline elements, preventing a stray scrollbar. */
+canvas {
+  display: block;
+}
+
+/* The HUD overlay sits on top of the canvas and covers the full window.
+   - position: fixed + inset: 0  -> pin to all four edges of the viewport.
+   - pointer-events: none        -> clicks/taps pass through to the game canvas.
+   - font + color                -> default readable white text for HUD elements. */
+#hud {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  font-family: system-ui, sans-serif;
+  color: #fff;
+}
