@@ -558,16 +558,22 @@ export function stepKart(state, input, dt, opts = {}) {
 
     // STEER -> rotate the surface-plane travel yaw (SAME coefficients as the world-yaw
     // steering below; no airSteerMult — anti-grav is always grounded/magnetic).
+    // INVERTED-CONTROL FIX: on the upside-down half of a corkscrew the surface up points
+    // DOWN (fr.up.y < 0) and the chase camera has rolled past vertical WITH the kart, so a
+    // fixed steer sign reads REVERSED to the player (A/D feel swapped on the ceiling). Flip
+    // the steer there so left/right always match the player's rolled view. Pure
+    // (surfaceFrameAt) + deterministic, so client and server stay byte-identical.
+    const steerSign = surfaceFrameAt(trackId, state.agS, state.agLateral).up.y < 0 ? -1 : 1;
     if (state.drifting) {
       const steerToward = state.steerActual * state.driftDir;
       const arcFactor =
         1 + steerToward * DRIFT.COUNTER_STEER_INFLUENCE + (input.brake || 0) * DRIFT.BRAKE_DRIFT_TIGHTEN;
       state.agHeading -=
-        state.driftDir * PHYSICS.TURN_RATE * handlingMult * gripMult * driftWeightMult *
+        steerSign * state.driftDir * PHYSICS.TURN_RATE * handlingMult * gripMult * driftWeightMult *
         DRIFT.DRIFT_TURN_MULT * arcFactor * dt * speedFactor;
     } else {
       state.agHeading -=
-        state.steerActual * PHYSICS.TURN_RATE * handlingMult * gripMult * dt * speedFactor * directionSign;
+        steerSign * state.steerActual * PHYSICS.TURN_RATE * handlingMult * gripMult * dt * speedFactor * directionSign;
     }
 
     // GRAVITY = a magnetic stick toward the surface: the kart does NOT fall and is
