@@ -1,8 +1,14 @@
-# Kart Racer
+# AURABORNE — Kart Racer
 
 An original Mario Kart-style 3D browser racing game. Built with vanilla JavaScript
 (ESM), [Three.js](https://threejs.org/) for rendering, and a Node + Express +
 [Socket.IO](https://socket.io/) server for authoritative online multiplayer.
+
+> ### ▶ [Play now in your browser](https://haohaokankan123.github.io/auraborne/)
+> Single-player (Grand Prix cups, Time Trial, Battle vs AI) runs entirely in the
+> browser — no install. There's a graphics quality slider (Low→Ultra) in the pause
+> menu, so it runs on weak laptops/Chromebooks too. **Online multiplayer needs the
+> Node server** (static GitHub Pages can't run it) — see [DEPLOY.md](./DEPLOY.md).
 
 > **No Nintendo IP.** Every asset is original: all 3D geometry is generated
 > procedurally in code, all audio is synthesized live with the Web Audio API, and
