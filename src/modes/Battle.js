@@ -51,10 +51,23 @@ const SPIN_EDGE_EPS = 0.05;      // s  spinTimer above this counts as "freshly h
 const ITEM_BOX_RESPAWN_HINT = 3; // (boxes respawn via ItemBoxManager's own timer)
 
 // RAM-to-pop tuning (client-only bumper-car combat; never touches shared physics).
-const RAM_CONTACT = 2.3;         // m   center distance counting as a body-to-body hit
-const RAM_CLOSING = 10;          // m/s closing speed needed for a contact to pop a balloon
+const RAM_CONTACT = 3.0;         // m   center distance counting as a body-to-body hit (forgiving so "drive into them" connects)
+const RAM_APPROACH = 8;          // m/s how fast the FASTER kart must be driving TOWARD the other to pop it. Based on the
+                                 //     attacker's own approach velocity (not mutual closing) so a tail-chase crash pops too,
+                                 //     not only head-ons — matches the "if I crash into them it should pop" intuition.
 const RAM_COOLDOWN = 0.6;        // s   per-victim guard so one crash pops exactly one balloon
 const POP_CREDIT_RADIUS = 3.0;   // m   how near a player projectile must be to credit a pop
+
+// PACE + ANTI-STUCK tuning (client-only; battle is single-player vs bots, so no parity concern).
+const PLAYER_SPEED_CAP = 31;     // m/s cruise cap for the PLAYER (vs the 44 race top) — slower = more control, easier to aim rams.
+const BOT_SPEED_CAP = 26;        // m/s cruise cap for BOTS, deliberately BELOW the player's so the player can run a fleeing
+                                 //     bot down and actually crash into it. Without this gap a same-speed tail-chase never
+                                 //     closes, so "drive into them to pop" is impossible. Active boost/star/overdrive is exempt.
+const STUCK_MOVE = 0.04;         // m   per-tick (60Hz) actual displacement below this = barely progressing (~2.4 m/s)
+const STUCK_TIME = 0.6;          // s   barely-moving this long => the bot is pinned (wall/corner) and triggers an escape
+const ESCAPE_TIME = 0.7;         // s   how long a pinned bot reverses + hard-steers toward center to free itself
+const BOT_SEP_RADIUS = 9;        // m   bots inside this of ANOTHER BOT (not their prey) repel apart — kills the clump
+const BOT_SEP_PUSH = 14;         // m   how far the separation vector nudges the heading goal away from a crowding bot
 
 // Distinct kart colors (player color is overridden by the selection if given).
 const BOT_COLORS = [
@@ -256,10 +269,18 @@ export class Battle {
         // Per-kart input + rising-edge item bookkeeping (mirrors RaceManager).
         _input: null,
         _prevUseItem: false,
-        // Tiny bit of wander state for the bot AI (deterministic-ish heading goal).
-        aiWanderHeading: pose.heading,
-        aiWanderTimer: 0,
+        // Roam state for the bot AI: a persistent random arena point it heads toward
+        // when not hunting/fleeing, so the field stays spread out instead of clumping.
+        aiRoamX: null,
+        aiRoamZ: null,
+        aiRoamTimer: 0,
         aiItemCooldown: 0,
+        // Anti-stuck watchdog: how long this bot has been barely moving, and an
+        // escape countdown. While escaping, the bot reverses + hard-steers toward
+        // center to peel off a wall/corner — guarantees a pinned bot can never
+        // freeze forever (a kart at ~0 speed has no steering authority to turn out).
+        _stuckTimer: 0,
+        _escapeTimer: 0,
         // Previous physics-tick transform, for render interpolation. Seeded to the
         // spawn pose so the very first frame (before any tick) interpolates against
         // itself and is perfectly stable — no snap from a zeroed pose.
@@ -427,6 +448,16 @@ export class Battle {
       // Keep karts inside the bounds as a hard backstop (walls already push back,
       // but clamp so a fast corner hit can never escape the floor).
       this._clampToArena(rec.state);
+
+      // BATTLE PACE: cap cruise speed below the 44 m/s race top so the whole match
+      // is slower and easier to line up rams. Bots are capped LOWER than the player so
+      // the player can chase them down and crash in. Active boost/star/overdrive is
+      // exempt so a mushroom/star still surges. Re-clamped every tick = a clean
+      // top-speed limiter; sub-cap accel is untouched, so it stays responsive.
+      const st = rec.state;
+      const boosting = st.boostTimer > 0 || st.starTimer > 0 || st.overdriveTimer > 0;
+      const cap = rec.isPlayer ? PLAYER_SPEED_CAP : BOT_SPEED_CAP;
+      if (!boosting && st.speed > cap) st.speed = cap;
     }
 
     // --- 2. Item boxes: award an item while the grabber has a free slot (up to 3). --
@@ -619,8 +650,6 @@ export class Battle {
     for (let i = 0; i < alive.length; i++) {
       const a = alive[i];
       const sa = a.state;
-      const avx = Math.sin(sa.heading) * sa.speed;
-      const avz = Math.cos(sa.heading) * sa.speed;
       for (let j = i + 1; j < alive.length; j++) {
         const b = alive[j];
         const sb = b.state;
@@ -631,15 +660,21 @@ export class Battle {
         const dist = Math.sqrt(d2);
         const nx = dx / dist; // unit a->b separation axis
         const nz = dz / dist;
-        const bvx = Math.sin(sb.heading) * sb.speed;
-        const bvz = Math.cos(sb.heading) * sb.speed;
-        // Closing speed = how fast the gap is shrinking along that axis.
-        const closing = (avx * nx + avz * nz) - (bvx * nx + bvz * nz);
-        if (closing < RAM_CLOSING) continue; // glancing / drafting — no pop
-        // The faster kart is the rammer; the slower/tied one takes the pop.
+        // The FASTER kart is the rammer; the slower/tied one takes the pop.
         const aFaster = Math.abs(sa.speed) >= Math.abs(sb.speed);
-        const victim = aFaster ? b : a;
         const attacker = aFaster ? a : b;
+        const victim = aFaster ? b : a;
+        const at = attacker.state;
+        // How fast is the attacker driving straight TOWARD the victim? Project the
+        // attacker's OWN velocity onto the attacker->victim axis. Using the attacker's
+        // approach (not the mutual closing speed) means a same-speed tail-chase crash
+        // still pops — "I drove into them" — while a side-by-side draft (approach ~0)
+        // does not. (nx,nz) is a->b, so attacker->victim flips with who's faster.
+        const toVictX = aFaster ? nx : -nx;
+        const toVictZ = aFaster ? nz : -nz;
+        const approach = Math.sin(at.heading) * at.speed * toVictX
+                       + Math.cos(at.heading) * at.speed * toVictZ;
+        if (approach < RAM_APPROACH) continue; // glancing / drafting — not a real crash
         const vs = victim.state;
         if (now < (victim._ramCooldownUntil || 0)) continue; // still in pop cooldown
         if (vs.spinTimer > SPIN_EDGE_EPS || isInvincible(vs)) continue; // mid-pop / starred
@@ -976,6 +1011,35 @@ export class Battle {
     const b = this.arena.bounds;
     if (rec.aiItemCooldown > 0) rec.aiItemCooldown -= dt;
 
+    // --- ANTI-STUCK WATCHDOG (the real freeze fix). A bot that drives into a wall or
+    //     corner gets its POSITION clamped to the bound, but its state.speed stays
+    //     HIGH (the model keeps integrating throttle; only position is clamped). So a
+    //     speed test never catches the pin — we must watch ACTUAL per-tick movement.
+    //     When a bot is trying to drive yet barely moves for STUCK_TIME, it's pinned:
+    //     reverse (brake) to peel off the wall and hard-steer toward arena center.
+    //     Backing up gives it real displacement + steering authority, so it always
+    //     frees itself instead of sitting in the corner forever (Charles's bug).
+    const moved = rec._lastX != null
+      ? Math.hypot(s.x - rec._lastX, s.z - rec._lastZ)
+      : 1; // first call: assume moving, don't false-trigger
+    rec._lastX = s.x;
+    rec._lastZ = s.z;
+
+    if (rec._escapeTimer > 0) {
+      rec._escapeTimer -= dt;
+      const toCenter = Math.atan2(-s.x, -s.z);
+      const cd = Math.atan2(Math.sin(toCenter - s.heading), Math.cos(toCenter - s.heading));
+      return { steer: cd >= 0 ? 1 : -1, throttle: 0, brake: 1, drift: false, useItem: false, lookBack: false };
+    }
+    // ~0.04 m/tick at 60Hz ≈ 2.4 m/s of real progress — below that while throttling
+    // means the wall is eating all forward motion.
+    if (moved < STUCK_MOVE) {
+      rec._stuckTimer += dt;
+      if (rec._stuckTimer >= STUCK_TIME) { rec._escapeTimer = ESCAPE_TIME; rec._stuckTimer = 0; }
+    } else {
+      rec._stuckTimer = 0;
+    }
+
     // --- Nearest balloon-carrying rival (the hunt target). ------------------
     let target = null;
     let bestD2 = Infinity;
@@ -1020,8 +1084,14 @@ export class Battle {
       }
     }
 
-    // --- Pick the heading GOAL by priority: dodge > flee > hunt > wander. ----
-    const CHASE_RANGE2 = 50 * 50;
+    // --- Pick the heading GOAL by priority: dodge > flee > hunt > roam. ------
+    // CHASE_RANGE is deliberately SHORT (~24m, not the old 50m). In a ~110m arena a
+    // 50m range meant every bot homed in on its nearest neighbour from across the
+    // map at once — they all converged into a single clump (the "they gather up"
+    // bug, which then froze or mutually rammed itself out in seconds). A short range
+    // means a bot only commits to a hunt when a rival is genuinely near; otherwise
+    // it ROAMS, which spreads the field across the whole arena.
+    const CHASE_RANGE2 = 24 * 24;
     let goalX;
     let goalZ;
     let chasing = false;
@@ -1042,15 +1112,46 @@ export class Battle {
       goalZ = target.state.z;
       chasing = true;
     } else {
-      // Wander: re-roll a center-biased heading goal every couple of seconds.
-      rec.aiWanderTimer -= dt;
-      if (rec.aiWanderTimer <= 0) {
-        rec.aiWanderTimer = 1.5 + Math.random() * 1.5;
-        const toCenter = Math.atan2(-s.x, -s.z);
-        rec.aiWanderHeading = toCenter + (Math.random() - 0.5) * Math.PI;
+      // ROAM: drive toward a persistent random point spread across the arena, re-rolled
+      // on arrival or every few seconds. NOT center-biased — a center bias just re-clumps
+      // everyone at the middle. Random spread points keep the bots fanned out, hunting
+      // items + crossing the arena, until a rival wanders into chase range.
+      rec.aiRoamTimer -= dt;
+      const rdx = rec.aiRoamX - s.x;
+      const rdz = rec.aiRoamZ - s.z;
+      if (rec.aiRoamX == null || rec.aiRoamTimer <= 0 || rdx * rdx + rdz * rdz < 8 * 8) {
+        rec.aiRoamTimer = 2.5 + Math.random() * 2.5;
+        const inset = 15; // keep roam targets off the rails
+        rec.aiRoamX = b.minX + inset + Math.random() * ((b.maxX - b.minX) - 2 * inset);
+        rec.aiRoamZ = b.minZ + inset + Math.random() * ((b.maxZ - b.minZ) - 2 * inset);
       }
-      goalX = s.x + Math.sin(rec.aiWanderHeading) * 20;
-      goalZ = s.z + Math.cos(rec.aiWanderHeading) * 20;
+      goalX = rec.aiRoamX;
+      goalZ = rec.aiRoamZ;
+    }
+
+    // --- SEPARATION (anti-clump). Repel from any OTHER BOT crowding us — but never
+    //     from the player (bots SHOULD hunt the human) nor from our own ram prey
+    //     (we want to close on that one). So bots converging on shared prey fan out
+    //     into a ring instead of collapsing onto one point — the clump never forms.
+    let sepX = 0;
+    let sepZ = 0;
+    for (let i = 0; i < alive.length; i++) {
+      const o = alive[i];
+      if (o.id === rec.id || o.isPlayer) continue;
+      if (target && o.id === target.id) continue;
+      const ox = s.x - o.state.x;
+      const oz = s.z - o.state.z;
+      const od2 = ox * ox + oz * oz;
+      if (od2 > 1e-4 && od2 < BOT_SEP_RADIUS * BOT_SEP_RADIUS) {
+        const od = Math.sqrt(od2);
+        const w = 1 - od / BOT_SEP_RADIUS; // stronger the closer the crowding bot is
+        sepX += (ox / od) * w;
+        sepZ += (oz / od) * w;
+      }
+    }
+    if (sepX !== 0 || sepZ !== 0) {
+      goalX += sepX * BOT_SEP_PUSH;
+      goalZ += sepZ * BOT_SEP_PUSH;
     }
 
     // --- Wall avoidance: near a bound, bend the goal HARD toward center (0,0)
