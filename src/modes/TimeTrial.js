@@ -268,6 +268,12 @@ export class TimeTrial {
    */
   release() {
     this._locked = false;
+    // Begin lap-1 recording at GO so the first ghost captures the FULL lap with
+    // lap-relative timestamps (lapStart is still 0 here) instead of only the
+    // final last-checkpoint->line sliver. (The lap system flips `started` near
+    // the last gate, not at the line, so we can't gate recording on it.)
+    this._lapTimingStarted = true;
+    this.currentRecording = [];
   }
 
   /**
@@ -307,7 +313,9 @@ export class TimeTrial {
     this.simClock = 0;
     this.currentRecording = [];
     this._lastLap = 0;
-    this._lapTimingStarted = false;
+    // Recording resumes immediately on restart (the kart is already unlocked — no
+    // countdown re-arm), so lap-1 after a restart captures the FULL lap too.
+    this._lapTimingStarted = true;
     this._prevSurface = 'road';
     this._offroadTime = 0;
     this._lastCp = 0;
@@ -412,16 +420,7 @@ export class TimeTrial {
       );
     }
 
-    // 3. Detect the start of lap timing. Once the kart has crossed the line the
-    //    first time, lapStart is set and `started` is true — from that point on
-    //    we record samples relative to the current lapStart.
-    if (prog && prog.started && !this._lapTimingStarted) {
-      this._lapTimingStarted = true;
-      // Begin a fresh recording for the first timed lap.
-      this.currentRecording = [];
-    }
-
-    // 4. Detect a completed lap (the lap counter went up since last tick). When
+    // 3. Detect a completed lap (the lap counter went up since last tick). When
     //    it does, the just-finished lap's buffer is in currentRecording and its
     //    time is the most recent entry in prog.lapTimes — decide if it's a new
     //    best and, if so, persist it as the ghost. Then start a fresh buffer.

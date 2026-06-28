@@ -147,12 +147,18 @@ export class Renderer {
     //   fov  = 60 degrees vertical field of view (a natural-feeling lens)
     //   aspect = width / height of the window (so nothing looks stretched)
     //   near = 0.1m  : closer than this is not drawn
-    //   far  = 2000m : farther than this is not drawn
+    //   far  = 3400m : farther than this is not drawn. The sky DOME is radius 1600
+    //     centered at the origin; the courses are large, so far from center the
+    //     OPPOSITE side of the dome sat past the old 2000 far-plane and got clipped —
+    //     the near-black background showed through as a "black hole" in the sky. A
+    //     kart stays inside the dome (<=1600 from origin), so the farthest dome point
+    //     is <=3200 away; 3400 keeps the whole dome (and distant stars) in view from
+    //     anywhere on the course. (depth precision impact is negligible at near 0.1.)
     this.camera = new THREE.PerspectiveCamera(
       60,
       window.innerWidth / window.innerHeight,
       0.1,
-      2000
+      3400
     );
     // Start the camera a little up and back so the first frame isn't at origin.
     this.camera.position.set(0, 4, -8);

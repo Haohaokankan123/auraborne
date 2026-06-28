@@ -1403,6 +1403,11 @@ export class Kart {
     // 1) Position.
     this.group.position.set(state.x, state.y, state.z);
 
+    // Contact shadow grounds the kart only while ON a surface. It's parented to the
+    // group, so while AIRBORNE it would rise into the sky with the kart and read as a
+    // dark quad floating in the air — hide it until the kart lands.
+    if (this._contactShadow) this._contactShadow.visible = !state.airborne;
+
     // Advance the free-running effect clock.
     this._effectClock += dt;
 

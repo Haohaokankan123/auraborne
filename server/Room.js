@@ -536,7 +536,12 @@ export class Room {
       // math + ordering the client Predictor uses (derive-at-pos, then step), so
       // the server authority and the client prediction stay byte-identical.
       const surf = this._sampleSurface(kart.state.x, kart.state.z, kart.state.y, kart.state.lastS);
-      kart.state.groundY = surf.groundY;
+      // Carved gap/chasm: park groundY 1000m below so updateVertical never clamps
+      // the kart onto the invisible centerline height inside the rendered hole — it
+      // plunges and _maybeRespawn's fellOff fires. IDENTICAL to RaceManager (SP) so
+      // the void mechanic works online and stays byte-identical to the client predictor.
+      const overGap = !surf.onRoad && surf.inGap;
+      kart.state.groundY = overGap ? surf.groundY - 1000 : surf.groundY;
       kart.state.slope = surf.slope;
       kart.state.surface = surf.surface;
       kart.state.lastS = surf.s; // continuity hint for next frame (overpass fix)
@@ -1018,6 +1023,21 @@ export class Room {
         karts[i].agS = round5(s.agS);
         karts[i].agLateral = round2(s.agLateral);
         karts[i].agHeading = round3(s.agHeading);
+      }
+      // TERRAIN: stream the vertical arc fields ONLY while airborne, so a normal
+      // grounded lap costs zero extra bytes (mirrors the agSection gate above).
+      // Without these the local player's reconcile flattens every mid-air arc:
+      // snapshotToState would default vy:0/airborne:false and updateVertical's
+      // grounded branch yanks the predicted y down to the road, then the next
+      // snapshot snaps it back up -> jitter. gliding is essential too -> a glide
+      // arc must replay with GLIDE_GRAVITY (kartModel.js), not GRAVITY (~3.7x
+      // faster), or it re-diverges; airTime restores the air-steer grip ramp +
+      // trick payout timing. Deterministic (round2 like x/y/z).
+      if (s.airborne) {
+        karts[i].vy = round2(s.vy);
+        karts[i].airborne = true;
+        karts[i].gliding = s.gliding;
+        karts[i].airTime = round2(s.airTime);
       }
     }
 

@@ -991,7 +991,7 @@ function updateDrift(state, input, dt, miniTurboMult = 1) {
       // Try to START a drift. Needs enough forward speed AND an actual steer
       // direction to lock onto (you can't drift straight or while crawling).
       // input.steer is -1..1; a tiny deadzone avoids latching on near-zero noise.
-      if (state.speed >= DRIFT.MIN_DRIFT_SPEED && Math.abs(input.steer) > 0.05) {
+      if (state.spinTimer <= 0 && state.speed >= DRIFT.MIN_DRIFT_SPEED && Math.abs(input.steer) > 0.05) {
         state.drifting = true;
         state.driftDir = Math.sign(input.steer); // -1 left / +1 right, locked
         state.driftCharge = 0;

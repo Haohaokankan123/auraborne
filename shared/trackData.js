@@ -1105,10 +1105,19 @@ export function isOnRoad(trackId, x, z, y, sHint) {
     trackId = undefined;
   }
   const key = resolveKey(trackId);
-  const t = TRACKS[key];
-  const halfW = t.roadWidth / 2;
-
   const near = nearest(key, x, z, y, sHint);
+  return _onRoadFromNear(key, near);
+}
+
+/**
+ * On-road decision given an ALREADY-computed nearest() projection. Factored out of
+ * isOnRoad so callers that already hold a `near` (e.g. sampleSurface) can reuse it
+ * instead of re-running the O(SAMPLES) nearest() scan. Math is identical to the
+ * old inline body — determinism + client/server parity preserved.
+ */
+function _onRoadFromNear(key, near) {
+  const halfW = TRACKS[key].roadWidth / 2;
+
   // REAL FALL-IN GAP: if the nearest centerline point falls inside a carved gap's
   // spline-param range, the road is GONE here — the kart is over the void and must
   // NOT be judged on-road (so it falls in if it missed the launch ramp). The
@@ -1196,10 +1205,11 @@ export function sampleSurface(trackId, x, z, y, sHint) {
   if (ds <= 1e-6) ds = 1e-6;
   const slope = (fwd.y - back.y) / ds;
 
-  // Pass y AND sHint so the onRoad/lateral pick agrees with the height- and
-  // continuity-aware centerline pick above (otherwise a lower-section kart could
-  // be judged against the upper one crossing overhead).
-  const onRoad = isOnRoad(key, x, z, y, sHint);
+  // Reuse the `near` projection from above (same y+sHint-aware centerline pick)
+  // instead of calling isOnRoad(), which would re-run the O(SAMPLES) nearest()
+  // scan with identical args. Result is byte-identical; the redundant 1200-sample
+  // second scan is eliminated.
+  const onRoad = _onRoadFromNear(key, near);
 
   // Surface classification: boost/ramp footprints win over plain road.
   let surface = onRoad ? 'road' : 'offroad';

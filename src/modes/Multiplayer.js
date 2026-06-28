@@ -939,7 +939,11 @@ class Predictor {
   _stepWithTerrain(input, dt, track) {
     const trackId = (track && track.trackId) || 'circuit';
     const surf = sampleSurface(trackId, this.state.x, this.state.z, this.state.y, this.state.lastS);
-    this.state.groundY = surf.groundY;
+    // Carved gap/chasm: park groundY 1000m below so the kart plunges into the void
+    // instead of coasting across the invisible centerline height. IDENTICAL to the
+    // server (Room._stepOnce) + RaceManager (SP) so prediction stays byte-identical.
+    const overGap = !surf.onRoad && surf.inGap;
+    this.state.groundY = overGap ? surf.groundY - 1000 : surf.groundY;
     this.state.slope = surf.slope;
     this.state.surface = surf.surface;
     this.state.lastS = surf.s; // continuity hint for next frame (overpass fix)

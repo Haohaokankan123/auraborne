@@ -132,6 +132,10 @@ export class Battle {
 
     // Combat clock + match state.
     this.clock = 0;            // seconds elapsed this battle.
+    // START LOCK: like RaceManager/TimeTrial, freeze the field until the 3-2-1-GO
+    // overlay calls release(). Without this, bots ram/fire and this.clock (=>
+    // TIME_LIMIT + final-10s beeps) advance during the countdown.
+    this._locked = true;
     this.finished = false;     // true once results are shown (main.js reads this).
     this.winnerId = null;
     // END FLOURISH: when a winner is decided we DON'T snap straight to results —
@@ -328,6 +332,15 @@ export class Battle {
   // FIXED-STEP UPDATE (called at 60Hz; dt === DT).
   // ========================================================================
   /**
+   * Called by main.js when the 3-2-1-GO countdown reaches GO. Lifts the start
+   * lock so combat and the match clock begin (mirrors RaceManager/TimeTrial).
+   */
+  release() { this._locked = false; }
+
+  /** @returns {boolean} true while the pre-GO start lock is held. */
+  isLocked() { return this._locked; }
+
+  /**
    * Advance the battle by one fixed step: gather input, step physics, run item
    * boxes/uses/projectiles, then resolve balloon pops from fresh hits and check
    * for a winner.
@@ -343,6 +356,11 @@ export class Battle {
       if (this._endTimer <= 0) this._finish();
       return; // freeze combat during the flourish
     }
+
+    // START LOCK: held true until the 3-2-1-GO overlay calls release(). Freeze all
+    // combat AND the clock during the countdown so bots can't pop a balloon early
+    // and TIME_LIMIT/final-10s beeps aren't offset by the ~2.1s countdown.
+    if (this._locked) return;
 
     this.clock += dt;
 

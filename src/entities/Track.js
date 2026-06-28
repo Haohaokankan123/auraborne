@@ -2573,4 +2573,40 @@ export class Track {
       }
     }
   }
+
+  /**
+   * Free ALL GPU resources this track built (geometries, materials, and the
+   * textures they hold — the scrolling road map/emissiveMap CanvasTextures and the
+   * 1024² skybox CanvasTexture). three.js does NOT auto-dispose on scene.remove(),
+   * so without this every race / track-switch orphaned them in GPU memory (a real
+   * Chromebook memory cliff). Call once on teardown, then drop the reference.
+   */
+  dispose() {
+    const seen = new Set();
+    const disposeMat = (m) => {
+      if (!m || seen.has(m)) return;
+      seen.add(m);
+      // Free any textures the material references before the material itself.
+      for (const k of ['map', 'emissiveMap', 'normalMap', 'roughnessMap', 'metalnessMap', 'alphaMap', 'aoMap', 'bumpMap', 'displacementMap']) {
+        const tex = m[k];
+        if (tex && typeof tex.dispose === 'function') tex.dispose();
+      }
+      if (typeof m.dispose === 'function') m.dispose();
+    };
+    this.group.traverse((o) => {
+      if (o.geometry && typeof o.geometry.dispose === 'function') o.geometry.dispose();
+      const mat = o.material;
+      if (Array.isArray(mat)) mat.forEach(disposeMat);
+      else disposeMat(mat);
+    });
+    // Scroll-texture refs (the road map/emissiveMap are also reached via the traverse
+    // above; dispose() is idempotent, so the overlap is harmless). Clear the array so
+    // a lingering reference can't keep them alive.
+    if (this._scrollTextures) {
+      for (const s of this._scrollTextures) {
+        if (s && s.tex && typeof s.tex.dispose === 'function') s.tex.dispose();
+      }
+      this._scrollTextures.length = 0;
+    }
+  }
 }

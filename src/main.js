@@ -357,6 +357,10 @@ function teardownMode() {
   if (track && track.group && track.group.parent) {
     track.group.parent.remove(track.group);
   }
+  // Free the track's GPU resources (geometries, materials, the 1024² skybox + road
+  // CanvasTextures, rail shaders). scene.remove() does NOT auto-dispose, so without
+  // this every race/track-switch leaked them — a real Chromebook memory cliff.
+  if (track && typeof track.dispose === 'function') track.dispose();
   track = null;
 
   raceClock = 0;
@@ -781,6 +785,7 @@ function restartCurrentMode() {
 // backs out of pre-race screens to the menu (the original behaviour).
 window.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape' && e.key !== 'p' && e.key !== 'P') return;
+  if (howToPlay && howToPlay._active) return; // How-To-Play owns input; don't mutate pause/_overlayOpen behind it
   if (e.repeat) return; // ignore auto-repeat while held, else it double-toggles the pause overlay
 
   // An open overlay closes first (works in every context, including the menu ⚙).
@@ -1194,7 +1199,9 @@ function update(dt) {
   }
 
   if (mode === 'gp' && manager) {
-    raceClock += dt;
+    // Don't tick the race clock during the 3-2-1 countdown (field frozen, locked).
+    // Mirrors TimeTrial.js:333 so lap-1 + total times exclude the ~2.1s grid hold.
+    if (typeof manager.isLocked === 'function' ? !manager.isLocked() : true) raceClock += dt;
     manager.update(dt, raceClock);
     // R11: when the player finishes, the RaceManager flips raceOver — show the
     // results board ONCE and wire its buttons to the existing GP/track/menu paths.

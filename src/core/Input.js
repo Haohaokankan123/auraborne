@@ -219,6 +219,17 @@ export class Input {
     const axes = pad.axes || [];
     const buttons = pad.buttons || [];
 
+    // Only override while the pad is actually being touched. A merely-connected
+    // idle pad (common when a controller is paired but the player is on WASD/touch)
+    // must NOT zero out keyboard/touch inputs every frame. Mirrors _applyTouch's
+    // isActive() gate.
+    const active =
+      axes.some((a) => Math.abs(a) > 0.15) ||
+      buttons.some((b) => b && (b.pressed || (b.value || 0) > 0.1));
+    if (!active) {
+      return;
+    }
+
     // steer: left stick X axis with a small deadzone so a resting stick
     // (which often reports a tiny non-zero value) does not cause drift.
     if (axes.length > 0) {
