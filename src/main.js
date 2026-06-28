@@ -240,6 +240,10 @@ const pauseMenu = new PauseMenu({
   onResume: () => closeOverlay(),
   onRestart: () => { closeOverlay(); restartCurrentMode(); },
   onQuit: () => { closeOverlay(); returnToMenu(); },
+  // Re-open the How-to-Play overlay (controls + this mode's objective) on top of the
+  // paused screen. Dismissing it (no-op onStart) just hides it again — the game stays
+  // paused with the pause menu still underneath. mode = the live mode key.
+  onHowTo: () => howToPlay.show(mode, () => {}),
   // Kart-style toggle wrote the pref; re-apply it so the NEXT race uses it.
   onKartSkin: () => applyKartSkin(),
   // Graphics-quality slider: live-apply the tier on the renderer (it also persists

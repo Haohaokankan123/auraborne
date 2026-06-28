@@ -34,11 +34,14 @@ export class PauseMenu {
    * @param {Function} [opts.onRestart] RESTART was clicked (single-player only).
    * @param {Function} [opts.onQuit]    QUIT TO MENU was clicked.
    */
-  constructor({ audio, onResume, onRestart, onQuit, onKartSkin, onQuality } = {}) {
+  constructor({ audio, onResume, onRestart, onQuit, onKartSkin, onQuality, onHowTo } = {}) {
     this._audio = audio || null;
     this._onResume = onResume || (() => {});
     this._onRestart = onRestart || (() => {});
     this._onQuit = onQuit || (() => {});
+    // Re-open the How-to-Play overlay (controls + this mode's objective) over the
+    // paused screen. No-op if not provided (e.g. the menu-context settings panel).
+    this._onHowTo = onHowTo || (() => {});
     // Called after the kart-style toggle writes its pref, so main.js can re-apply
     // (load/clear) the shared model for the next race. No-op if not provided.
     this._onKartSkin = onKartSkin || (() => {});
@@ -84,6 +87,13 @@ export class PauseMenu {
     );
     this._resumeBtn.addEventListener('click', () => this._onResume());
 
+    // HOW TO PLAY — re-open the controls + mode-objective overlay anytime.
+    this._howToBtn = this._makeButton(
+      'HOW TO PLAY',
+      'from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500'
+    );
+    this._howToBtn.addEventListener('click', () => this._onHowTo());
+
     this._restartBtn = this._makeButton(
       'RESTART',
       'from-amber-500 to-orange-600 hover:from-amber-400 hover:to-orange-500'
@@ -97,6 +107,7 @@ export class PauseMenu {
     this._quitBtn.addEventListener('click', () => this._onQuit());
 
     card.appendChild(this._resumeBtn);
+    card.appendChild(this._howToBtn);
     card.appendChild(this._restartBtn);
     card.appendChild(this._quitBtn);
 
@@ -323,16 +334,19 @@ export class PauseMenu {
       this._resumeBtn.textContent = 'BACK TO RACE';
       this._restartBtn.style.display = 'none';
       this._quitBtn.style.display = '';
+      this._howToBtn.style.display = '';   // in a live race -> explain it
     } else if (context === 'menu') {
       this._title.textContent = 'SETTINGS';
       this._resumeBtn.textContent = 'CLOSE';
       this._restartBtn.style.display = 'none';
       this._quitBtn.style.display = 'none';
+      this._howToBtn.style.display = 'none'; // no active mode to explain from the menu
     } else {
       this._title.textContent = 'PAUSED';
       this._resumeBtn.textContent = 'RESUME';
       this._restartBtn.style.display = '';
       this._quitBtn.style.display = '';
+      this._howToBtn.style.display = '';
     }
 
     this._syncFromAudio();
