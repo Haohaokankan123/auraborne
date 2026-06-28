@@ -60,9 +60,11 @@ const POP_CREDIT_RADIUS = 3.0;   // m   how near a player projectile must be to 
 
 // PACE + ANTI-STUCK tuning (client-only; battle is single-player vs bots, so no parity concern).
 const PLAYER_SPEED_CAP = 31;     // m/s cruise cap for the PLAYER (vs the 44 race top) — slower = more control, easier to aim rams.
-const BOT_SPEED_CAP = 26;        // m/s cruise cap for BOTS, deliberately BELOW the player's so the player can run a fleeing
-                                 //     bot down and actually crash into it. Without this gap a same-speed tail-chase never
-                                 //     closes, so "drive into them to pop" is impossible. Active boost/star/overdrive is exempt.
+// Bot cruise caps span a personality range: rookies cruise below the player (so the player can
+// run them down for a ram), aces ride right at the player's cap so they genuinely threaten and
+// can chase the player down. Each bot's cap is MIN + aggression*(MAX-MIN). Boosts are exempt.
+const BOT_SPEED_CAP_MIN = 26;    // m/s rookie cruise cap
+const BOT_SPEED_CAP_MAX = 31;    // m/s ace cruise cap (≈ player)
 const STUCK_MOVE = 0.04;         // m   per-tick (60Hz) actual displacement below this = barely progressing (~2.4 m/s)
 const STUCK_TIME = 0.6;          // s   barely-moving this long => the bot is pinned (wall/corner) and triggers an escape
 const ESCAPE_TIME = 0.7;         // s   how long a pinned bot reverses + hard-steers toward center to free itself
@@ -235,6 +237,14 @@ export class Battle {
       }
       const state = createKartState(stateOpts);
 
+      // --- BOT PERSONALITY: a per-bot spread so the field plays unpredictably and
+      //     not as 7 identical drones. aggression drives hunt range / item eagerness /
+      //     top speed (elite bots match the player and genuinely threaten); the weave
+      //     adds an organic, hard-to-read wobble to their pathing; skill sharpens
+      //     steering + reactions. Randomised per battle so no two matches feel the same.
+      const aggression = isPlayer ? 0 : 0.5 + Math.random() * 0.5;   // 0.5 (rookie) .. 1.0 (ace)
+      const skill = isPlayer ? 0 : 0.65 + Math.random() * 0.35;      // steering crispness / reaction
+
       // Visual kart, colored per player selection / bot palette.
       const color = isPlayer
         ? (this.selection.color != null ? this.selection.color : 0xff3b30)
@@ -281,6 +291,16 @@ export class Battle {
         // freeze forever (a kart at ~0 speed has no steering authority to turn out).
         _stuckTimer: 0,
         _escapeTimer: 0,
+        // Personality (see above). aiSpeedCap: elite bots (high aggression) approach the
+        // player's top speed so they can run the player down; rookies stay slower.
+        aiAggression: aggression,
+        aiSkill: skill,
+        aiSpeedCap: BOT_SPEED_CAP_MIN + aggression * (BOT_SPEED_CAP_MAX - BOT_SPEED_CAP_MIN),
+        aiWeavePhase: Math.random() * Math.PI * 2,       // desync each bot's wobble
+        aiWeaveFreq: 1.1 + Math.random() * 1.4,          // rad/s of the steering wobble
+        aiWeaveAmp: 0.10 + (1 - skill) * 0.18,           // lower-skill bots wander more visibly
+        _lastX: null,
+        _lastZ: null,
         // Previous physics-tick transform, for render interpolation. Seeded to the
         // spawn pose so the very first frame (before any tick) interpolates against
         // itself and is perfectly stable — no snap from a zeroed pose.
@@ -393,7 +413,7 @@ export class Battle {
       this._objectiveShown = true;
       if (this.hud && typeof this.hud.showRewardBanner === 'function') {
         this.hud.showRewardBanner(
-          '🎈 POP THEIR BALLOONS — ram rivals at speed, or hit them with items (SHIFT)',
+          '🎈 POP THEIR BALLOONS — ram rivals at speed, or hit them with items (SHIFT or CLICK)',
           'alert',
           1.8
         );
@@ -456,7 +476,7 @@ export class Battle {
       // top-speed limiter; sub-cap accel is untouched, so it stays responsive.
       const st = rec.state;
       const boosting = st.boostTimer > 0 || st.starTimer > 0 || st.overdriveTimer > 0;
-      const cap = rec.isPlayer ? PLAYER_SPEED_CAP : BOT_SPEED_CAP;
+      const cap = rec.isPlayer ? PLAYER_SPEED_CAP : rec.aiSpeedCap;
       if (!boosting && st.speed > cap) st.speed = cap;
     }
 
@@ -631,13 +651,16 @@ export class Battle {
   }
 
   /**
-   * RAM pops (bumper-car combat). For every pair of alive karts in body contact,
-   * compute the closing speed along their separation axis from each kart's scalar
-   * speed + heading; if they're crashing together fast enough, the SLOWER (struck)
-   * kart's balloon pops. We set its spinTimer to HIT_POP_SPIN so the existing
-   * rising-edge resolver converts it to a normal pop (free burst VFX + pop SFX),
-   * record the rammer for the scoring cue, and arm a brief per-victim cooldown so
-   * one crash pops exactly one balloon (not a chain while bodies stay locked).
+   * RAM pops (bumper-car combat). For every pair of alive karts in body contact, the
+   * ATTACKER is whoever is driving INTO the other harder — i.e. the kart with the
+   * greater approach velocity along the separation axis — and the OTHER kart's balloon
+   * pops if that approach clears RAM_APPROACH. This is BIDIRECTIONAL and speed-
+   * INDEPENDENT on purpose: a slower bot that T-bones the faster player still pops the
+   * player (an earlier "faster kart always wins" rule made the player — the fastest
+   * kart — immune to every bot ram, so bots could never eliminate the human). We set
+   * the victim's spinTimer to HIT_POP_SPIN so the rising-edge resolver converts it to a
+   * normal pop (free burst VFX + pop SFX), credit the rammer, and arm a brief per-victim
+   * cooldown so one crash pops exactly one balloon (not a chain while bodies stay locked).
    *
    * O(n^2/2) over <= 8 karts (~28 pairs) — trivial at 60Hz. Client-only: the
    * shared sim has no kart-kart collision, and we touch nothing it owns.
@@ -650,6 +673,8 @@ export class Battle {
     for (let i = 0; i < alive.length; i++) {
       const a = alive[i];
       const sa = a.state;
+      const avx = Math.sin(sa.heading) * sa.speed;
+      const avz = Math.cos(sa.heading) * sa.speed;
       for (let j = i + 1; j < alive.length; j++) {
         const b = alive[j];
         const sb = b.state;
@@ -660,20 +685,15 @@ export class Battle {
         const dist = Math.sqrt(d2);
         const nx = dx / dist; // unit a->b separation axis
         const nz = dz / dist;
-        // The FASTER kart is the rammer; the slower/tied one takes the pop.
-        const aFaster = Math.abs(sa.speed) >= Math.abs(sb.speed);
-        const attacker = aFaster ? a : b;
-        const victim = aFaster ? b : a;
-        const at = attacker.state;
-        // How fast is the attacker driving straight TOWARD the victim? Project the
-        // attacker's OWN velocity onto the attacker->victim axis. Using the attacker's
-        // approach (not the mutual closing speed) means a same-speed tail-chase crash
-        // still pops — "I drove into them" — while a side-by-side draft (approach ~0)
-        // does not. (nx,nz) is a->b, so attacker->victim flips with who's faster.
-        const toVictX = aFaster ? nx : -nx;
-        const toVictZ = aFaster ? nz : -nz;
-        const approach = Math.sin(at.heading) * at.speed * toVictX
-                       + Math.cos(at.heading) * at.speed * toVictZ;
+        const bvx = Math.sin(sb.heading) * sb.speed;
+        const bvz = Math.cos(sb.heading) * sb.speed;
+        // How fast is each kart driving TOWARD the other (its velocity along the axis
+        // that points at the other kart)? The one driving in harder is the rammer.
+        const approachA = avx * nx + avz * nz;     // a -> b
+        const approachB = bvx * -nx + bvz * -nz;   // b -> a
+        let attacker, victim, approach;
+        if (approachA >= approachB) { attacker = a; victim = b; approach = approachA; }
+        else { attacker = b; victim = a; approach = approachB; }
         if (approach < RAM_APPROACH) continue; // glancing / drafting — not a real crash
         const vs = victim.state;
         if (now < (victim._ramCooldownUntil || 0)) continue; // still in pop cooldown
@@ -1040,16 +1060,47 @@ export class Battle {
       rec._stuckTimer = 0;
     }
 
-    // --- Nearest balloon-carrying rival (the hunt target). ------------------
+    // --- TARGET: the rival to hunt. Not merely the nearest — we WEIGHT toward the
+    //     player (bots should gang up on the human) and toward low-balloon rivals
+    //     (finish the wounded), scaled by this bot's aggression. nearestD2 still tracks
+    //     the closest rival (any) for the dodge/flee geometry. ---------------------
     let target = null;
-    let bestD2 = Infinity;
+    let bestScore = Infinity;
+    let bestD2 = Infinity;       // squared distance to the CHOSEN target
+    let nearestD2 = Infinity;    // squared distance to the NEAREST rival (any)
     for (let i = 0; i < alive.length; i++) {
       const o = alive[i];
       if (o.id === rec.id) continue;
       const dx = o.state.x - s.x;
       const dz = o.state.z - s.z;
       const d2 = dx * dx + dz * dz;
-      if (d2 < bestD2) { bestD2 = d2; target = o; }
+      if (d2 < nearestD2) nearestD2 = d2;
+      // score = distance minus attraction bonuses (lower = more attractive prey).
+      // The player bonus is large + aggression-scaled so aces strongly prefer hunting
+      // the human (they should make the player's life hard), while rookies stay more
+      // opportunistic and skirmish with whoever's near.
+      const score = Math.sqrt(d2)
+        - (o.isPlayer ? 30 * rec.aiAggression : 0)        // hunt the human
+        - (START_BALLOONS - o.balloons) * 7;              // finish the wounded
+      if (score < bestScore) { bestScore = score; target = o; bestD2 = d2; }
+    }
+
+    // --- Nearest ACTIVE item box, so an UNARMED bot can go arm itself (then it's a
+    //     real threat) — and seeking boxes naturally fans the bots out across the map.
+    let boxX = null;
+    let boxZ = null;
+    let boxD2 = Infinity;
+    const boxList = this.itemBoxes && this.itemBoxes._boxes;
+    if (boxList) {
+      for (let i = 0; i < boxList.length; i++) {
+        const bxn = boxList[i];
+        if (!bxn.active) continue;
+        const p = bxn.mesh.position;
+        const dx = p.x - s.x;
+        const dz = p.z - s.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < boxD2) { boxD2 = d2; boxX = p.x; boxZ = p.z; }
+      }
     }
 
     // --- Incoming hazard to DODGE: nearest active projectile we don't own,
@@ -1084,14 +1135,21 @@ export class Battle {
       }
     }
 
-    // --- Pick the heading GOAL by priority: dodge > flee > hunt > roam. ------
-    // CHASE_RANGE is deliberately SHORT (~24m, not the old 50m). In a ~110m arena a
-    // 50m range meant every bot homed in on its nearest neighbour from across the
-    // map at once — they all converged into a single clump (the "they gather up"
-    // bug, which then froze or mutually rammed itself out in seconds). A short range
-    // means a bot only commits to a hunt when a rival is genuinely near; otherwise
-    // it ROAMS, which spreads the field across the whole arena.
-    const CHASE_RANGE2 = 24 * 24;
+    // --- Pick the heading GOAL by priority: dodge > flee > ram > arm-up > hunt > roam.
+    //     Hunt range scales with aggression so rookies only commit to a near rival
+    //     (~26m) while aces pursue from across the arena (~50m). A SHORT base range +
+    //     separation keeps the field from collapsing into one clump (the old bug);
+    //     unarmed bots peel off to grab a box, which spreads them out further.
+    const hasItem = this.itemSystem.hasItem(rec.id);
+    const RAM_RANGE2 = 28 * 28;                              // commit to a kill on any near rival
+    // Hunt range scales with aggression. When the TARGET is the player it's much
+    // longer (covers the arena) so bots actively run the human down from anywhere —
+    // the human should always be under pressure, not ignored when it sits still.
+    const huntingPlayer = !!(target && target.isPlayer);
+    const huntRange = huntingPlayer
+      ? 45 + rec.aiAggression * 45                           // ~67 (rookie) .. 90 (ace) metres — arena-spanning
+      : 26 + rec.aiAggression * 24;                          // ~26 .. 50 metres for bot-vs-bot
+    const huntRange2 = huntRange * huntRange;
     let goalX;
     let goalZ;
     let chasing = false;
@@ -1099,28 +1157,41 @@ export class Battle {
     if (dodgeX != null) {
       goalX = dodgeX;
       goalZ = dodgeZ;
-    } else if (rec.balloons <= 1 && target && bestD2 < 34 * 34) {
-      // Last balloon: run from the nearest rival, biased back toward center.
+    } else if (rec.balloons <= 1 && target && nearestD2 < 30 * 30 && rec.aiAggression < 0.8) {
+      // On the LAST balloon a non-ace plays safe: flee the nearest rival, biased to center.
+      // (Aces stay aggressive even when low — they go down swinging.)
       const ax = s.x - target.state.x;
       const az = s.z - target.state.z;
       const al = Math.hypot(ax, az) || 1;
       goalX = s.x + (ax / al) * 20 - s.x * 0.25;
       goalZ = s.z + (az / al) * 20 - s.z * 0.25;
       fleeing = true;
-    } else if (target && bestD2 < CHASE_RANGE2) {
-      goalX = target.state.x;
-      goalZ = target.state.z;
+    } else if (target && bestD2 < RAM_RANGE2) {
+      // A rival is in ram range — commit to the crash regardless of item state. Aim at an
+      // INTERCEPT point (lead the target by its velocity) so the bot cuts the rival off and
+      // actually connects, instead of tail-chasing a moving target and orbiting it forever.
+      goalX = target.state.x + Math.sin(target.state.heading) * target.state.speed * 0.45;
+      goalZ = target.state.z + Math.cos(target.state.heading) * target.state.speed * 0.45;
+      chasing = true;
+    } else if (!hasItem && boxX != null && boxD2 < 55 * 55) {
+      // Unarmed: go grab a power-up so the bot can actually fight (and it spreads out).
+      goalX = boxX;
+      goalZ = boxZ;
+    } else if (target && bestD2 < huntRange2) {
+      // Armed (or just aggressive): pursue the weighted target across the arena, leading
+      // its motion so the bot closes the gap on an intercept course rather than the tail.
+      goalX = target.state.x + Math.sin(target.state.heading) * target.state.speed * 0.45;
+      goalZ = target.state.z + Math.cos(target.state.heading) * target.state.speed * 0.45;
       chasing = true;
     } else {
       // ROAM: drive toward a persistent random point spread across the arena, re-rolled
       // on arrival or every few seconds. NOT center-biased — a center bias just re-clumps
-      // everyone at the middle. Random spread points keep the bots fanned out, hunting
-      // items + crossing the arena, until a rival wanders into chase range.
+      // everyone at the middle. Random spread points keep the bots fanned out.
       rec.aiRoamTimer -= dt;
-      const rdx = rec.aiRoamX - s.x;
-      const rdz = rec.aiRoamZ - s.z;
+      const rdx = (rec.aiRoamX == null ? s.x : rec.aiRoamX) - s.x;
+      const rdz = (rec.aiRoamZ == null ? s.z : rec.aiRoamZ) - s.z;
       if (rec.aiRoamX == null || rec.aiRoamTimer <= 0 || rdx * rdx + rdz * rdz < 8 * 8) {
-        rec.aiRoamTimer = 2.5 + Math.random() * 2.5;
+        rec.aiRoamTimer = 2 + Math.random() * 2.5;
         const inset = 15; // keep roam targets off the rails
         rec.aiRoamX = b.minX + inset + Math.random() * ((b.maxX - b.minX) - 2 * inset);
         rec.aiRoamZ = b.minZ + inset + Math.random() * ((b.maxZ - b.minZ) - 2 * inset);
@@ -1129,10 +1200,17 @@ export class Battle {
       goalZ = rec.aiRoamZ;
     }
 
+    // COMMITTING: this bot is locked onto a rival in ram range and driving in for the
+    // kill. When committing we damp BOTH separation and the weave so the bot actually
+    // connects the crash — otherwise separation rings several attackers around the prey
+    // at arm's length and nobody ever lands the hit (the player would never get popped).
+    const committing = chasing && bestD2 < RAM_RANGE2;
+
     // --- SEPARATION (anti-clump). Repel from any OTHER BOT crowding us — but never
     //     from the player (bots SHOULD hunt the human) nor from our own ram prey
     //     (we want to close on that one). So bots converging on shared prey fan out
     //     into a ring instead of collapsing onto one point — the clump never forms.
+    //     Damped while committing so a closing attacker drives through to contact.
     let sepX = 0;
     let sepZ = 0;
     for (let i = 0; i < alive.length; i++) {
@@ -1150,8 +1228,9 @@ export class Battle {
       }
     }
     if (sepX !== 0 || sepZ !== 0) {
-      goalX += sepX * BOT_SEP_PUSH;
-      goalZ += sepZ * BOT_SEP_PUSH;
+      const sepScale = committing ? 0.12 : 1;
+      goalX += sepX * BOT_SEP_PUSH * sepScale;
+      goalZ += sepZ * BOT_SEP_PUSH * sepScale;
     }
 
     // --- Wall avoidance: near a bound, bend the goal HARD toward center (0,0)
@@ -1166,12 +1245,16 @@ export class Battle {
     }
 
     // --- Steering: signed angle from heading to the goal (AIRacer convention).
+    //     Higher-skill bots steer a touch crisper. An organic sine WEAVE makes the
+    //     pathing unpredictable (no robotic straight lines) — but it's damped right
+    //     down when locked onto a close ram target so the crash/shot still lands.
     const dx = goalX - s.x;
     const dz = goalZ - s.z;
     const targetAngle = Math.atan2(dx, dz);
     let delta = targetAngle - s.heading;
     delta = Math.atan2(Math.sin(delta), Math.cos(delta));
-    let steer = delta * 1.7;
+    let steer = delta * (1.5 + rec.aiSkill * 0.6);
+    steer += Math.sin(this.clock * rec.aiWeaveFreq + rec.aiWeavePhase) * rec.aiWeaveAmp * (committing ? 0.2 : 1);
     if (steer > 1) steer = 1;
     else if (steer < -1) steer = -1;
     const absSteer = Math.abs(steer);
@@ -1186,31 +1269,34 @@ export class Battle {
     //     wall (drift cuts the turn authority needed to peel away). -----------
     const drift = absSteer > 0.55 && Math.abs(s.speed) > 12 && !nearWall;
 
-    // --- TACTICAL item use by held-item category + geometry. ----------------
+    // --- TACTICAL item use by held-item category + geometry. Aces fire from further
+    //     and more often (shorter cooldown) than rookies. ---------------------------
     let useItem = false;
     if (rec.aiItemCooldown <= 0) {
       const held = this.itemSystem.getHeld(rec.id);
       const heldId = held && held.id;
       if (heldId) {
-        // Where is the nearest rival relative to our facing?
+        // Where is the CHOSEN target relative to our facing?
         let inFront = false;
         let behindClose = false;
         if (target) {
           const tAng = Math.atan2(target.state.x - s.x, target.state.z - s.z);
           const td = Math.atan2(Math.sin(tAng - s.heading), Math.cos(tAng - s.heading));
-          inFront = Math.abs(td) < 0.9;                 // within ~50deg ahead
-          behindClose = Math.abs(td) > 2.2 && bestD2 < 16 * 16; // a close chaser
+          inFront = Math.abs(td) < 1.0;                              // within ~57deg ahead
+          behindClose = Math.abs(td) > 2.2 && nearestD2 < 18 * 18;   // a close chaser
         }
+        const fireRange = 30 + rec.aiAggression * 14;                // ~30..44 m
+        const fireRange2 = fireRange * fireRange;
         if (FORWARD_ITEMS.has(heldId)) {
-          useItem = !!target && inFront && bestD2 < 34 * 34; // rival lined up ahead
+          useItem = !!target && inFront && bestD2 < fireRange2;       // rival lined up ahead
         } else if (DEFENSIVE_ITEMS.has(heldId)) {
-          useItem = behindClose || dodgeX != null;            // chaser / evading
+          useItem = behindClose || dodgeX != null;                   // chaser / evading
         } else {
           // Self / area effect (boost/star/lightning/boo/...): use it to commit
           // whenever actively hunting, fleeing, or dodging.
           useItem = chasing || fleeing || dodgeX != null;
         }
-        if (useItem) rec.aiItemCooldown = 0.7;
+        if (useItem) rec.aiItemCooldown = 0.7 - rec.aiAggression * 0.3; // aces fire ~2x as often
       }
     }
 

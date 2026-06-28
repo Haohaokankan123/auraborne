@@ -373,14 +373,17 @@ export class HUD {
     this.itemNameElement.textContent = '';
     this.itemPanel.appendChild(this.itemNameElement);
 
-    // The "PRESS SHIFT" key prompt. The word SHIFT sits in a small key-cap so it
-    // reads as a button you press. Matches the useItem binding (Shift/KeyE).
+    // The item-use key prompt. SHIFT and CLICK sit in small key-caps so they read as
+    // buttons. Matches the useItem binding (Shift/KeyE/left-click — click avoids the
+    // Shift+WASD keyboard ghosting that can otherwise eat the keypress while driving).
     this.itemPromptElement = document.createElement('div');
     this.itemPromptElement.className =
       'mt-2 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider opacity-90';
     this.itemPromptElement.innerHTML =
       '<span>Press</span>' +
-      '<span class="px-1.5 py-0.5 rounded bg-white/15 ring-1 ring-white/40 font-bold">SHIFT</span>';
+      '<span class="px-1.5 py-0.5 rounded bg-white/15 ring-1 ring-white/40 font-bold">SHIFT</span>' +
+      '<span>or</span>' +
+      '<span class="px-1.5 py-0.5 rounded bg-white/15 ring-1 ring-white/40 font-bold">CLICK</span>';
     this.itemPanel.appendChild(this.itemPromptElement);
 
     this.element.appendChild(this.itemPanel);

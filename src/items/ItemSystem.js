@@ -347,9 +347,12 @@ export class ItemSystem {
     }
     if (!filled.length) return null;
 
-    // Pick a RANDOM filled slot via the injected rng (NOT Math.random) so a server
-    // and a client driven by the same seed fire the SAME slot — the parity hinge.
-    const pick = filled[Math.min(filled.length - 1, Math.floor(this.rng() * filled.length))];
+    // Fire the FIRST filled slot. Predictable: the HUD shows the slots left-to-right,
+    // so "use item" always fires the leading one the player sees — pressing fire with a
+    // shell up front throws the shell, not a random other slot (the old random pick made
+    // it feel like "the shell doesn't throw"). Deterministic (slot order is fixed 0,1,2),
+    // so a server and a same-seeded client still fire the SAME slot — parity holds.
+    const pick = filled[0];
     const record = slots[pick];
 
     const def = getItem(record.id);

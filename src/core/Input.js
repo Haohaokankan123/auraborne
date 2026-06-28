@@ -43,6 +43,18 @@ export class Input {
     window.addEventListener('keydown', this._onKeyDown);
     window.addEventListener('keyup', this._onKeyUp);
 
+    // MOUSE item-fire: left-click also uses an item. Many keyboards can't register
+    // Shift + W + A/D at once (key "ghosting"), so holding the throttle + a steer key
+    // silently drops the Shift press and the item never fires WHILE DRIVING — exactly
+    // when you want it. A mouse button is a separate device that never ghosts, so the
+    // player can drive with the left hand and fire with a click. We only track the flag
+    // (no preventDefault) so menu/overlay clicks still work normally.
+    this._mouseItemDown = false;
+    this._onMouseDown = (e) => { if (e.button === 0) this._mouseItemDown = true; };
+    this._onMouseUp = (e) => { if (e.button === 0) this._mouseItemDown = false; };
+    window.addEventListener('mousedown', this._onMouseDown);
+    window.addEventListener('mouseup', this._onMouseUp);
+
     // The on-screen touch controls, created lazily by enableTouch(). Null until
     // then. When set, its state overrides the keyboard while a finger is down.
     this.touch = null;
@@ -122,11 +134,12 @@ export class Input {
     // drift: Space held
     const driftDown = this._isDown('Space');
 
-    // useItem: either Shift key or KeyE held
+    // useItem: Shift, KeyE, or a left mouse-click (the click avoids Shift+WASD ghosting).
     const useItemDown =
       this._isDown('ShiftLeft') ||
       this._isDown('ShiftRight') ||
-      this._isDown('KeyE');
+      this._isDown('KeyE') ||
+      this._mouseItemDown;
 
     // lookBack: KeyF held
     const lookBackDown = this._isDown('KeyF');
