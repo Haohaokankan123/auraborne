@@ -86,12 +86,6 @@ import { PHYSICS } from '../../shared/constants.js';
 // future change to the sample shape can bump the key and ignore stale data.
 const GHOST_STORAGE_KEY = 'tt_ghost_v1';
 
-// Laps required before the run is considered "done". The mode keeps running
-// (and keeps letting you beat your best) past this — it is mainly a HUD cue.
-// Set to 3 to mirror the Grand Prix; the recording/ghost logic is per-lap so
-// this value does not affect best-lap tracking.
-const TOTAL_LAPS = 3;
-
 // Medal -> emoji, for the lap-complete banner + the ghost badge.
 const MEDAL_EMOJI = { gold: '🥇', silver: '🥈', bronze: '🥉' };
 
@@ -175,7 +169,13 @@ export class TimeTrial {
     // --- Lap system: one racer ('player'). ----------------------------------
     // Same pure lap/checkpoint tracker the race uses; it gives us nextCp, lap
     // counting, lapStart, lapTimes, and bestLap for free.
-    this.lapSystem = new LapSystem(track, TOTAL_LAPS);
+    // ENDLESS hot-lapping: pass Infinity so the racer is never marked finished.
+    // With a finite cap, LapSystem.update() flips rec.finished at lap N and then
+    // returns early every tick — freezing checkpoint/lap counting, so
+    // _onLapCompleted would never fire again and no later lap could beat the PB
+    // without quitting the mode. It also stops main.js firing a phantom finish
+    // fanfare + confetti mid-session. The HUD lap label is derived in render().
+    this.lapSystem = new LapSystem(track, Infinity);
     this.lapSystem.addRacer('player');
 
     // --- Recording state. ----------------------------------------------------
@@ -236,10 +236,29 @@ export class TimeTrial {
     // "+0.42s" means behind). Built here, removed in dispose().
     this.deltaElement = this._buildDeltaElement();
 
+    // The player's best REAL lap so far (their PB), used to compute the live medal
+    // goal AND the HUD's BEST field. Seed from the persisted ghost ONLY when it's a
+    // real recorded PB — never the bundled STAFF benchmark — otherwise null until
+    // the first completed lap.
+    this._bestLap = (this.ghost && !this.ghost.staff) ? this.ghost.time : null;
+
+    // Persistent medal-goal hint ("NEXT 🥈 2:25") sitting just under the delta, so
+    // the run always has a visible target instead of only a transient lap banner.
+    this.goalElement = this._buildGoalElement();
+    this._updateGoalDisplay();
+
     // The player's last steer, mirrored so render() can angle the front wheels
     // to match the live input (render must not poll Input itself — same reason
     // the RaceManager caches _playerLastSteer).
     this._playerLastSteer = 0;
+
+    // QUICK RESTART: tap R to soft-reset the run in place (see _restart). R is the
+    // one free key — W/S/A/D/Space/Shift/E/F/Q are all bound in Input.js. Ignored
+    // while locked on the grid (pre-GO) and on auto-repeat. Removed in dispose().
+    this._onRestartKey = (e) => {
+      if (e.code === 'KeyR' && !e.repeat && !this._locked) this._restart();
+    };
+    window.addEventListener('keydown', this._onRestartKey);
   }
 
   /**
@@ -249,6 +268,53 @@ export class TimeTrial {
    */
   release() {
     this._locked = false;
+  }
+
+  /**
+   * QUICK RESTART (the R key): soft-reset the run in place — kart back to the grid
+   * pose, clock + recording + lap progress zeroed — WITHOUT rebuilding the scene or
+   * replaying main.js's 3-2-1 countdown. The loaded ghost is KEPT so you instantly
+   * re-race the same line. Mirrors the constructor's fresh-start conditions exactly,
+   * so the first timed lap after a restart times identically to a fresh launch.
+   * No-op while still locked on the grid (pre-GO).
+   * ponytail: stays unlocked (release() already fired on the first GO); add a
+   * countdown-on-restart only if main.js later exposes a re-arm hook.
+   * @private
+   */
+  _restart() {
+    // Re-seed the deterministic state at the start pose: this resets EVERY field
+    // (speed, vy, airborne, drift, miniTurbo, agSection, spinTimer, …) to its
+    // createKartState default, so no stale momentum/spin carries into the retry.
+    this.playerState = createKartState({
+      stats: this.selection.stats,
+      ...this.track.startPosition,
+    });
+
+    // Reset the render-interpolation prev-pose to the new spawn so the first frame
+    // after the restart doesn't streak the kart from its old mid-track position.
+    const pt = this.playerPrevTransform;
+    pt.x = this.playerState.x;
+    pt.y = this.playerState.y;
+    pt.z = this.playerState.z;
+    pt.heading = this.playerState.heading;
+    this._playerLastSteer = 0;
+
+    // Fresh lap record (addRacer overwrites the 'player' entry: nextCp=1,
+    // started=false, lapStart=0, lap=0).
+    this.lapSystem.addRacer('player');
+
+    // Zero all timing + recording + terrain bookkeeping back to construction state.
+    this.simClock = 0;
+    this.currentRecording = [];
+    this._lastLap = 0;
+    this._lapTimingStarted = false;
+    this._prevSurface = 'road';
+    this._offroadTime = 0;
+    this._lastCp = 0;
+
+    // Quick screen-flash so the reset reads as deliberate, not a glitch (reuses the
+    // pooled respawn flash; guarded — it's a TT-added HUD method).
+    if (this.hud && typeof this.hud.respawnFlash === 'function') this.hud.respawnFlash();
   }
 
   // ========================================================================
@@ -422,6 +488,8 @@ export class TimeTrial {
     // source of truth for "is this a record"; the ghost above is just the replay.
     if (lapTime != null) {
       const isRecord = recordBestLap(this.trackId, lapTime);
+      // Track the player's best REAL lap (drives the medal goal + HUD BEST field).
+      if (this._bestLap == null || lapTime < this._bestLap) this._bestLap = lapTime;
       const medal = medalFor(lapTime, TARGET_LAP_TIMES[this.trackId]);
       if (this.hud && typeof this.hud.showRewardBanner === 'function') {
         const lapStr = this._fmtLap(lapTime);
@@ -438,6 +506,8 @@ export class TimeTrial {
       }
       // Keep the floating ghost badge in sync with the (possibly new) best time.
       if (beatsBest) this._setGhostBadge(this.ghost.time);
+      // Refresh the persistent medal-goal hint now this lap may have earned a medal.
+      this._updateGoalDisplay();
     }
 
     // Start a clean buffer for the lap now in progress.
@@ -488,19 +558,27 @@ export class TimeTrial {
     // 4. HUD: current lap time, best lap, mini-turbo pill, speed (all via the
     //    shared HUD), then our own delta overlay.
     if (this.hud) {
+      // ENDLESS laps: show the REAL climbing lap number (4, 5, …) — never a frozen
+      // "3/3". The shared HUD clamps the displayed lap to totalLaps, so the
+      // denominator must stay AT LEAST the current lap. We keep it exactly one
+      // above (lap+1) so the lap is always shown in full AND the HUD's "FINAL LAP"
+      // alert (fires on lap >= totalLaps) never false-triggers — there is no final
+      // lap in an endless time attack, and a sticky red lap pill would be a bug.
+      const displayLap = (prog ? prog.lap : 0) + 1;
       const info = {
-        // Show the lap 1-based, capped at TOTAL_LAPS like the race HUD does.
-        lap: Math.min((prog ? prog.lap : 0) + 1, TOTAL_LAPS),
-        totalLaps: TOTAL_LAPS,
+        lap: displayLap,
+        totalLaps: displayLap + 1,
         // Solo run: always 1st of 1 (the HUD still wants these to render).
         position: 1,
         totalRacers: 1,
         // Current lap elapsed time. Before the first line cross lapStart is 0,
         // so this reads the time-on-track so far (which is fine pre-start).
         lapTime: lapElapsed,
-        // Best lap = the ghost's time (our persisted best) if we have one,
-        // otherwise the lap system's in-session best (e.g. first ever run).
-        bestLap: this.ghost ? this.ghost.time : (prog ? prog.bestLap : null),
+        // BEST = your PB only. Use the ghost's time as BEST only when it's a REAL
+        // recorded lap, not the bundled STAFF benchmark (which isn't your record);
+        // otherwise the lap system's in-session best (null until the first lap, so
+        // the HUD shows its "--:--.---" placeholder).
+        bestLap: (this.ghost && !this.ghost.staff) ? this.ghost.time : (prog ? prog.bestLap : null),
         miniTurboTier: this.playerState.miniTurboTier,
       };
       this.hud.update(this.playerState, info);
@@ -597,10 +675,18 @@ export class TimeTrial {
     }
 
     const samples = this.ghost.samples;
-    // Nearest saved sample to the player's current XZ position.
-    let nearest = samples[0];
+    // Nearest saved sample to the player's current XZ position — but ONLY among
+    // samples whose lap time is within DELTA_WINDOW seconds of the player's current
+    // lap time. Both player and ghost progress monotonically through the lap, so the
+    // ghost passed the player's CURRENT spot at roughly the player's CURRENT time;
+    // the time gate stops a self-crossing track (Cloudtop's figure-8) from matching
+    // the geometrically-near sample on the OTHER arm of the lap — which would snap
+    // the delta by tens of seconds at the crossover.
+    const DELTA_WINDOW = 4;
+    let nearest = null;
     let bestD2 = Infinity;
     for (let i = 0; i < samples.length; i++) {
+      if (Math.abs(samples[i].t - lapElapsed) > DELTA_WINDOW) continue;
       const dx = samples[i].x - this.playerState.x;
       const dz = samples[i].z - this.playerState.z;
       const d2 = dx * dx + dz * dz;
@@ -609,16 +695,33 @@ export class TimeTrial {
         nearest = samples[i];
       }
     }
+    // Fallback: the player is >DELTA_WINDOW off the ghost's pace here, so no sample
+    // sits in the time window — use the globally nearest sample so the delta still
+    // reads (the cross-arm ambiguity only matters near even pace, handled above).
+    if (!nearest) {
+      for (let i = 0; i < samples.length; i++) {
+        const dx = samples[i].x - this.playerState.x;
+        const dz = samples[i].z - this.playerState.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < bestD2) {
+          bestD2 = d2;
+          nearest = samples[i];
+        }
+      }
+    }
 
-    // delta = how long the PLAYER has taken to reach this spot minus how long
-    // the GHOST took. Negative = player ahead, positive = behind.
+    // delta = how long the PLAYER has taken to reach this spot minus how long the
+    // GHOST took. Negative = player ahead, positive = behind.
     const delta = lapElapsed - nearest.t;
+    const ahead = delta <= 0;
 
-    // Format with a sign and two decimals; green when ahead, red when behind.
-    const sign = delta <= 0 ? '-' : '+';
+    // Signed two-decimal gap, green ahead / red behind, with a trailing ▲/▼ so the
+    // direction reads WITHOUT relying on colour alone (accessibility).
+    const sign = ahead ? '-' : '+';
+    const arrow = ahead ? '▲' : '▼';
     const secs = Math.abs(delta).toFixed(2);
-    this.deltaElement.textContent = ghostLabel + ' ' + sign + secs + 's';
-    this.deltaElement.style.color = delta <= 0 ? '#34c759' : '#ff453a';
+    this.deltaElement.textContent = ghostLabel + ' ' + sign + secs + 's ' + arrow;
+    this.deltaElement.style.color = ahead ? '#34c759' : '#ff453a';
   }
 
   // ========================================================================
@@ -906,6 +1009,75 @@ export class TimeTrial {
   }
 
   /**
+   * Build the persistent medal-goal hint: a small glass pill sitting just under the
+   * delta overlay showing the NEXT medal threshold to beat for this track (e.g.
+   * "NEXT 🥈 2:25"). DOM/CSS only — cheap, low-tier safe — and styled to match the
+   * existing neon glass pills (translucent slate fill + faint ring + blur). Appended
+   * to #hud; removed in dispose().
+   * @returns {HTMLElement}
+   * @private
+   */
+  _buildGoalElement() {
+    const el = document.createElement('div');
+    el.id = 'hud-tt-goal';
+    // Centered at top-20 (just below #hud-ghost-delta at top-12). Glass pill in the
+    // shared neon style; mono so the digits don't jitter; never blocks the canvas.
+    el.className =
+      'absolute top-20 left-1/2 -translate-x-1/2 px-3 py-0.5 rounded-full ' +
+      'bg-slate-900/55 ring-1 ring-white/15 backdrop-blur-sm text-xs font-bold font-mono ' +
+      'tracking-wide drop-shadow pointer-events-none whitespace-nowrap';
+    const host = document.getElementById('hud') || document.body;
+    host.appendChild(el);
+    return el;
+  }
+
+  /**
+   * Refresh the medal-goal hint from the player's current best lap: show the next
+   * faster threshold to chase (bronze -> silver -> gold), tinted to that medal, or
+   * "🥇 GOLD" once gold is held. Cheap; called on construction, on each completed
+   * lap, and on restart — never per frame.
+   * @private
+   */
+  _updateGoalDisplay() {
+    if (!this.goalElement) return;
+    const targets = TARGET_LAP_TIMES[this.trackId];
+    if (!targets) { this.goalElement.style.display = 'none'; return; }
+
+    const best = this._bestLap;
+    let text;
+    let color;
+    if (best == null || best > targets.bronze) {
+      text = 'NEXT ' + MEDAL_EMOJI.bronze + ' ' + this._fmtGoal(targets.bronze);
+      color = '#e8a87c'; // bronze
+    } else if (best > targets.silver) {
+      text = 'NEXT ' + MEDAL_EMOJI.silver + ' ' + this._fmtGoal(targets.silver);
+      color = '#dbe4ee'; // silver
+    } else if (best > targets.gold) {
+      text = 'NEXT ' + MEDAL_EMOJI.gold + ' ' + this._fmtGoal(targets.gold);
+      color = '#ffd76a'; // gold
+    } else {
+      text = MEDAL_EMOJI.gold + ' GOLD'; // top medal already held
+      color = '#ffd76a';
+    }
+    this.goalElement.textContent = text;
+    this.goalElement.style.color = color;
+  }
+
+  /**
+   * Compact m:ss for a medal threshold (e.g. 145 -> "2:25"). The lap timer uses the
+   * fuller mm:ss.mmm; the goal hint just needs a glanceable target.
+   * @param {number} seconds
+   * @returns {string}
+   * @private
+   */
+  _fmtGoal(seconds) {
+    const s = Math.round(seconds);
+    const m = Math.floor(s / 60);
+    const ss = s % 60;
+    return m + ':' + String(ss).padStart(2, '0');
+  }
+
+  /**
    * HAZARD contact (Phase 3): spin the player out if touching a hazard feature
    * (oil/cone) this tick. Distance test against the pre-resolved feature world
    * positions. applySpin honors invincibility (no star in time trial, but safe).
@@ -992,6 +1164,18 @@ export class TimeTrial {
       this.deltaElement.parentNode.removeChild(this.deltaElement);
     }
     this.deltaElement = null;
+
+    // Remove the medal-goal hint overlay.
+    if (this.goalElement && this.goalElement.parentNode) {
+      this.goalElement.parentNode.removeChild(this.goalElement);
+    }
+    this.goalElement = null;
+
+    // Drop the quick-restart key listener.
+    if (this._onRestartKey) {
+      window.removeEventListener('keydown', this._onRestartKey);
+      this._onRestartKey = null;
+    }
   }
 
   // ========================================================================

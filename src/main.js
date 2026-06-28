@@ -85,6 +85,7 @@ import { MultiplayerRace } from './modes/Multiplayer.js'; // Online race (M4).
 // Screens.
 import { Menu } from './ui/screens/Menu.js';
 import { PauseMenu } from './ui/screens/PauseMenu.js'; // pause / settings overlay.
+import { HowToPlay } from './ui/screens/HowToPlay.js'; // pre-race how-to overlay (all modes).
 import { CharacterSelect } from './ui/screens/CharacterSelect.js';
 import { TrackSelect } from './ui/screens/TrackSelect.js'; // M6 track picker.
 import { ResultsScreen } from './ui/ResultsScreen.js'; // R11 end-of-race results board.
@@ -199,6 +200,8 @@ let difficulty = 'medium';
 let cup = null;
 let socket = null;
 let lobby = null;
+// HOW-TO gate: true while the pre-race how-to overlay is up (see gateHowTo).
+let _howToPending = false;
 
 // M6 audio/VFX bookkeeping: per-frame edge detection state for one-shot SFX +
 // effects. Reset each time a race starts (see resetFxState). We watch the
@@ -268,6 +271,11 @@ const trackSelect = new TrackSelect({
 // R11: the end-of-race results board. Built once (hidden); shown when a GP race
 // ends (manager.raceOver). Its buttons reuse the existing GP / track / menu paths.
 const resultsScreen = new ResultsScreen();
+
+// HOW-TO-PLAY overlay: shown before EVERY mode's gameplay (controls + this mode's
+// objective). Built once (hidden); gateHowTo() shows it and the dismiss callback
+// boots the race — see gateHowTo + the start* functions below.
+const howToPlay = new HowToPlay();
 
 // COIN SHOP: spend coins earned racing on cosmetics. Built once (hidden); opened
 // from the menu's SHOP button. BACK returns to the menu (same path as Esc).
@@ -468,9 +476,31 @@ function onDifficultyConfirmed(d) {
 }
 
 // ----------------------------------------------------------------------------
+// 4b. HOW-TO-PLAY gate — show the per-mode overlay before any race boots.
+// ----------------------------------------------------------------------------
+// Each start* function calls this FIRST. On the first call it shows the overlay
+// (freezing any lingering single-player sim behind it — never in MP, which the
+// server keeps simulating) and returns true, so the caller bails immediately. The
+// overlay's dismiss callback re-invokes that same start function; this time the
+// pending flag is set, so we release the freeze and return false to let the race
+// build (manager + countdown + showTouch all run AFTER dismiss, never before).
+function gateHowTo(modeKey, boot) {
+  if (_howToPending) {        // re-entered from the overlay's dismiss callback
+    _howToPending = false;
+    paused = false;           // release the hold; the fresh race is about to build
+    return false;             // proceed
+  }
+  _howToPending = true;
+  if (modeKey !== 'mp') paused = true; // hold any current sim still (MP must never freeze)
+  howToPlay.show(modeKey, boot);
+  return true;                // bail; boot() re-enters once dismissed
+}
+
+// ----------------------------------------------------------------------------
 // 5. GRAND PRIX — the M1-M3 race, seeded with selection + chosen track.
 // ----------------------------------------------------------------------------
 function startGrandPrix() {
+  if (gateHowTo('gp', startGrandPrix)) return; // how-to first; boots on dismiss
   teardownMode();
   _resultsShown = false; // re-arm the end-of-race results board for this race
 
@@ -506,6 +536,7 @@ function startGrandPrix() {
 // 6. TIME TRIAL — solo time attack vs a ghost, on the chosen track.
 // ----------------------------------------------------------------------------
 function startTimeTrial() {
+  if (gateHowTo('tt', startTimeTrial)) return; // how-to first; boots on dismiss
   teardownMode();
 
   track = new Track(trackId);
@@ -544,6 +575,7 @@ function startTimeTrial() {
 // 7. BATTLE — balloon free-for-all. Battle self-builds its Arena (no Track).
 // ----------------------------------------------------------------------------
 function startBattle() {
+  if (gateHowTo('battle', startBattle)) return; // how-to first; boots on dismiss
   teardownMode();
   _battleResultsShown = false; // re-arm the end-of-battle results board
 
@@ -610,6 +642,9 @@ function startMultiplayer() {
 
 // Build the Track + MultiplayerRace once the server says the race is starting.
 function beginMultiplayerRace(payload) {
+  // How-to first; the dismiss callback re-enters with the same payload. MP never
+  // freezes (the server keeps simulating), so gateHowTo holds nothing for 'mp'.
+  if (gateHowTo('mp', () => beginMultiplayerRace(payload))) return;
   if (lobby) {
     lobby.dispose();
     lobby = null;

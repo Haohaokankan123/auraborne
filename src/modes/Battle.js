@@ -50,6 +50,12 @@ const HIT_POP_SPIN = 1.0;        // s  brief spin applied as the balloon-pop rea
 const SPIN_EDGE_EPS = 0.05;      // s  spinTimer above this counts as "freshly hit"
 const ITEM_BOX_RESPAWN_HINT = 3; // (boxes respawn via ItemBoxManager's own timer)
 
+// RAM-to-pop tuning (client-only bumper-car combat; never touches shared physics).
+const RAM_CONTACT = 2.3;         // m   center distance counting as a body-to-body hit
+const RAM_CLOSING = 10;          // m/s closing speed needed for a contact to pop a balloon
+const RAM_COOLDOWN = 0.6;        // s   per-victim guard so one crash pops exactly one balloon
+const POP_CREDIT_RADIUS = 3.0;   // m   how near a player projectile must be to credit a pop
+
 // Distinct kart colors (player color is overridden by the selection if given).
 const BOT_COLORS = [
   0x34c759, 0x0a84ff, 0xffd60a, 0xff9f0a, 0xbf5af2,
@@ -138,6 +144,12 @@ export class Battle {
     this._knockoutSeq = 0;
     // Last integer second we beeped, so the final-10s countdown beeps once/second.
     this._lastBeepSec = null;
+    // One-shot guard for the match-start objective banner (shows HOW to pop).
+    this._objectiveShown = false;
+    // Reused flat [x,z,x,z,...] snapshot of the player's live projectiles, taken
+    // BEFORE projectiles.update so a pop can be credited to the player's shell/bomb
+    // (the hitting projectile is recycled by the time pops resolve). Alloc-free.
+    this._playerProjScratch = [];
 
     // Scratch context reused for the simple bot AI each tick (no per-tick alloc).
     this._aiCtx = {};
@@ -230,6 +242,13 @@ export class Battle {
 
         // Previous-tick spinTimer, for the rising-edge "just got hit" detection.
         prevSpin: 0,
+        // Who caused this kart's pending pop ('player' | bot id | null). Set by the
+        // ram pass + the player-fired specials + the projectile-proximity credit,
+        // then read once by _popBalloon for the scoring cue and cleared.
+        poppedBy: null,
+        // Timestamp (battle clock) until which this kart can't be ram-popped again,
+        // so a single crash pops one balloon, not a chain while bodies stay locked.
+        _ramCooldownUntil: 0,
         // Per-kart input + rising-edge item bookkeeping (mirrors RaceManager).
         _input: null,
         _prevUseItem: false,
@@ -327,6 +346,21 @@ export class Battle {
 
     this.clock += dt;
 
+    // MATCH-START OBJECTIVE: the moment combat begins, name HOW to pop a balloon
+    // using the REAL controls (items = SHIFT/E held, ram = drive into a rival at
+    // speed). This is the single biggest comprehension fix — the player no longer
+    // has to guess. One DOM/GSAP banner (low-tier safe), fired exactly once.
+    if (!this._objectiveShown) {
+      this._objectiveShown = true;
+      if (this.hud && typeof this.hud.showRewardBanner === 'function') {
+        this.hud.showRewardBanner(
+          '🎈 POP THEIR BALLOONS — ram rivals at speed, or hit them with items (SHIFT)',
+          'alert',
+          1.8
+        );
+      }
+    }
+
     // FINAL-10s urgency beep: once per second over the last 10 seconds, rising in
     // pitch as it closes (sfxCountdown: lower n = higher/urgent). The visual pulse
     // lives on the HUD clock (fed timeLeft in render()).
@@ -404,7 +438,18 @@ export class Battle {
     // --- 4. Projectiles: move/home/bounce/collide vs the alive karts. -------
     // On a hit the projectile system sets state.spinTimer (via applySpin). We do
     // NOT let that stand as a full race spin-out — step 5 converts it to a pop.
+    // Snapshot the player's live projectiles FIRST: a hitting projectile is recycled
+    // during update(), so this pre-shot positions list is how we credit a shell/bomb
+    // pop to the player (see _playerProjectileNear).
+    this._snapshotPlayerProjectiles();
     this.projectiles.update(dt, alive);
+
+    // --- 4.5 RAM pops: a hard body-to-body contact at speed pops the struck
+    //     kart's balloon, so "drive into them" actually works (the headline fun +
+    //     clarity fix). Runs BEFORE the resolver so the spin it sets converts to a
+    //     normal pop — inheriting the pooled burst VFX + pop SFX for free. Client
+    //     -only (no kart-kart collision in the shared sim is touched).
+    this._resolveRamHits(alive);
 
     // --- 5. Balloon pops: detect fresh hits (spinTimer rising edge). --------
     this._resolveBalloonHits(alive);
@@ -495,6 +540,8 @@ export class Battle {
       // Apply the spin directly (the model's applySpin guards invincibility); the
       // rising-edge detector then pops a balloon.
       if (secs > leader.state.spinTimer) leader.state.spinTimer = secs;
+      // Credit the firer so a player leader-strike shows the green "POP!" confirm.
+      leader.poppedBy = rec.id;
     }
     // Visual flourish only — COSMETIC so it never collides and can't pop a
     // balloon off an unintended kart. The real hit was applied above.
@@ -517,6 +564,8 @@ export class Battle {
       const dz = other.state.z - oz;
       if (dx * dx + dz * dz <= R2 && !isInvincible(other.state)) {
         if (HIT_POP_SPIN > other.state.spinTimer) other.state.spinTimer = HIT_POP_SPIN;
+        // Credit the horn user so a player blast shows the green "POP!" confirm.
+        other.poppedBy = rec.id;
       }
     }
     // Destroy projectiles in the blast (reuse the pool the projectile system owns).
@@ -530,6 +579,98 @@ export class Battle {
         if (dx * dx + dz * dz <= R2) this.projectiles._recycle(proj);
       }
     }
+  }
+
+  /**
+   * RAM pops (bumper-car combat). For every pair of alive karts in body contact,
+   * compute the closing speed along their separation axis from each kart's scalar
+   * speed + heading; if they're crashing together fast enough, the SLOWER (struck)
+   * kart's balloon pops. We set its spinTimer to HIT_POP_SPIN so the existing
+   * rising-edge resolver converts it to a normal pop (free burst VFX + pop SFX),
+   * record the rammer for the scoring cue, and arm a brief per-victim cooldown so
+   * one crash pops exactly one balloon (not a chain while bodies stay locked).
+   *
+   * O(n^2/2) over <= 8 karts (~28 pairs) — trivial at 60Hz. Client-only: the
+   * shared sim has no kart-kart collision, and we touch nothing it owns.
+   * @param {Array} alive
+   * @private
+   */
+  _resolveRamHits(alive) {
+    const R2 = RAM_CONTACT * RAM_CONTACT;
+    const now = this.clock;
+    for (let i = 0; i < alive.length; i++) {
+      const a = alive[i];
+      const sa = a.state;
+      const avx = Math.sin(sa.heading) * sa.speed;
+      const avz = Math.cos(sa.heading) * sa.speed;
+      for (let j = i + 1; j < alive.length; j++) {
+        const b = alive[j];
+        const sb = b.state;
+        const dx = sb.x - sa.x;
+        const dz = sb.z - sa.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 > R2 || d2 < 1e-4) continue; // out of contact (or exactly overlapping)
+        const dist = Math.sqrt(d2);
+        const nx = dx / dist; // unit a->b separation axis
+        const nz = dz / dist;
+        const bvx = Math.sin(sb.heading) * sb.speed;
+        const bvz = Math.cos(sb.heading) * sb.speed;
+        // Closing speed = how fast the gap is shrinking along that axis.
+        const closing = (avx * nx + avz * nz) - (bvx * nx + bvz * nz);
+        if (closing < RAM_CLOSING) continue; // glancing / drafting — no pop
+        // The faster kart is the rammer; the slower/tied one takes the pop.
+        const aFaster = Math.abs(sa.speed) >= Math.abs(sb.speed);
+        const victim = aFaster ? b : a;
+        const attacker = aFaster ? a : b;
+        const vs = victim.state;
+        if (now < (victim._ramCooldownUntil || 0)) continue; // still in pop cooldown
+        if (vs.spinTimer > SPIN_EDGE_EPS || isInvincible(vs)) continue; // mid-pop / starred
+        vs.spinTimer = HIT_POP_SPIN;          // -> a pop in _resolveBalloonHits
+        victim.poppedBy = attacker.id;        // attribution for the scoring cue
+        victim._ramCooldownUntil = now + RAM_COOLDOWN;
+      }
+    }
+  }
+
+  /**
+   * Snapshot the player's live (non-cosmetic) projectile positions into a reused
+   * flat [x,z,x,z,...] array. Taken BEFORE projectiles.update, because a projectile
+   * that lands a hit is recycled the same tick — this pre-impact list is how
+   * _playerProjectileNear later credits a shell/bomb pop to the player.
+   * @private
+   */
+  _snapshotPlayerProjectiles() {
+    const snap = this._playerProjScratch;
+    snap.length = 0;
+    const pool = this.projectiles && this.projectiles._pool;
+    if (!pool) return;
+    for (let i = 0; i < pool.length; i++) {
+      const p = pool[i];
+      if (p && p.active && p.ownerId === 'player' && !p.cosmetic) {
+        snap.push(p.mesh.position.x, p.mesh.position.z);
+      }
+    }
+  }
+
+  /**
+   * True if one of the player's snapshotted projectiles was within POP_CREDIT_RADIUS
+   * of this kart state — i.e. the player's shell/bomb most likely caused the pop.
+   * ponytail: positional heuristic (a projectile is recycled before pops resolve, so
+   * exact owner isn't readable without editing the shared projectile system). Worst
+   * case is a rare cosmetic mis-credit when two shots overlap — never a sim bug.
+   * @param {object} state
+   * @returns {boolean}
+   * @private
+   */
+  _playerProjectileNear(state) {
+    const snap = this._playerProjScratch;
+    const R2 = POP_CREDIT_RADIUS * POP_CREDIT_RADIUS;
+    for (let i = 0; i < snap.length; i += 2) {
+      const dx = snap[i] - state.x;
+      const dz = snap[i + 1] - state.z;
+      if (dx * dx + dz * dz <= R2) return true;
+    }
+    return false;
   }
 
   /**
@@ -574,6 +715,12 @@ export class Battle {
       }
       // Trim the spin to a brief pop reaction.
       if (s.spinTimer > HIT_POP_SPIN) s.spinTimer = HIT_POP_SPIN;
+      // Credit a projectile pop to the player if (and only if) one of the player's
+      // own shells/bombs was right beside this victim just before impact, and the
+      // pop wasn't already attributed by the ram pass / a player special.
+      if (!rec.poppedBy && rec.id !== 'player' && this._playerProjectileNear(s)) {
+        rec.poppedBy = 'player';
+      }
       this._popBalloon(rec);
     }
   }
@@ -599,9 +746,26 @@ export class Battle {
     // player spin-edge hook, so we don't duplicate it here.
     if (this.audio && typeof this.audio.sfxPop === 'function') this.audio.sfxPop();
 
-    if (rec.balloons <= 0) {
-      this._knockOut(rec);
+    // READABLE CUE so every balloon change is understood (the feedback loop the
+    // player said was missing). When the player LOSES one: an urgent "-1" cue (the
+    // red screen flash already comes from main.js). When the player SCORES one off
+    // a rival: a green "POP!" confirm naming the victim. Suppressed on the KILLING
+    // pop — _knockOut's banner says it better and would otherwise be clobbered.
+    const scoredByPlayer = rec.poppedBy === 'player';
+    if (rec.balloons > 0 && this.hud && typeof this.hud.showRewardBanner === 'function') {
+      if (rec.isPlayer) {
+        this.hud.showRewardBanner('POP!  -1 balloon', 'alert');
+      } else if (scoredByPlayer) {
+        this.hud.showRewardBanner('POP! 🎈  ' + this._displayName(rec) + ' -1');
+      }
     }
+
+    if (rec.balloons <= 0) {
+      this._knockOut(rec, scoredByPlayer);
+    }
+    // Attribution is single-use: clear it so a later pop from another source can't
+    // inherit a stale "scored by" credit.
+    rec.poppedBy = null;
   }
 
   /**
@@ -609,20 +773,39 @@ export class Battle {
    * any held item. It stays in this.karts (for the final tally) but is filtered
    * out of every combat list by _aliveKarts().
    * @param {object} rec
+   * @param {boolean} [scoredByPlayer]  the player landed the finishing pop.
    * @private
    */
-  _knockOut(rec) {
+  _knockOut(rec, scoredByPlayer = false) {
     rec.alive = false;
     rec.outOrder = ++this._knockoutSeq; // later knockout = survived longer = better place
     rec.kart.group.visible = false;
     this.itemSystem.clear(rec.id);
-    // ELIMINATION FEED: a brief centered toast naming who's out. Reuses the HUD's
-    // pooled reward banner (one element, no DOM leak; back-to-back calls just
-    // re-pop it). Skip when the knockout IS the match-ender — _beginEnding's win
-    // banner says it better and would otherwise be clobbered the same frame.
+
+    const canBanner = this.hud && typeof this.hud.showRewardBanner === 'function';
+
+    // THE PLAYER'S OWN ELIMINATION is always announced, loud and distinct — even
+    // when it's the match-decider (the camera is about to pan to a survivor, which
+    // is otherwise a confusing silent jump). A bold, longer alert banner + a red
+    // screen wash so "you're out, now spectating" is unmissable.
+    if (rec.isPlayer) {
+      if (canBanner) this.hud.showRewardBanner("YOU'RE OUT — spectating", 'alert', 1.6);
+      if (typeof this.hud._pulseFlash === 'function') {
+        this.hud._pulseFlash('rgba(244, 63, 94, 0.5)', 0.5, 0.6); // rose-500 wash
+      }
+      return;
+    }
+
+    // ELIMINATION FEED for a bot: a brief centered toast naming who's out (and
+    // crediting the player when they landed it, to reward aggression). Skip when
+    // the knockout IS the match-ender — _beginEnding's win banner says it better
+    // and would otherwise be clobbered the same frame.
     const aliveLeft = this.getAliveCount();
-    if (aliveLeft > 1 && this.hud && typeof this.hud.showRewardBanner === 'function') {
-      this.hud.showRewardBanner('💥 ' + this._displayName(rec) + ' knocked out!');
+    if (aliveLeft > 1 && canBanner) {
+      const who = this._displayName(rec);
+      this.hud.showRewardBanner(
+        scoredByPlayer ? '💥 You knocked out ' + who + '!' : '💥 ' + who + ' knocked out!'
+      );
     }
   }
 
@@ -964,6 +1147,9 @@ export class Battle {
           balloons: player.balloons,
           maxBalloons: START_BALLOONS,
           alive: alive.length,
+          // Once the player is out, the HUD swaps the survivor count to a
+          // "SPECTATING" standing so they know they're watching, not playing.
+          playerOut: player.balloons <= 0,
           // Remaining match time -> HUD mm:ss clock (+ final-10s red pulse).
           timeLeft: Math.max(0, TIME_LIMIT - this.clock),
           miniTurboTier: player.state.miniTurboTier,

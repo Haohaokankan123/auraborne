@@ -73,6 +73,14 @@ import { getItem } from '../items/items.js'; // resolve the snapshot's held-item
 // common, comfortable default for a 20Hz snapshot stream.
 const INTERP_DELAY = 0.1;
 
+// CONNECTION WATCHDOG: the server streams snapshots ~20Hz (every ~50ms). If they
+// stop arriving for this long mid-race the link is effectively dead — the
+// Interpolator just holds the last frame, which reads as a silent freeze. We use
+// the snapshot gap itself (rather than a transport 'status' event) so the notice
+// is fully self-contained in this client orchestration file. 1.5s ≈ 30 missed
+// snapshots: long enough to ignore a brief packet hiccup, short enough to be honest.
+const CONN_LOST_SECS = 1.5;
+
 export class MultiplayerRace {
   /**
    * @param {Object} opts
@@ -129,6 +137,22 @@ export class MultiplayerRace {
     // performance.now() converted to seconds.
     this._now = () => performance.now() / 1000;
 
+    // --- Live standings + connection watchdog ----------------------------
+    // The 'raceStart' grid + snapshots carry NO player names (only ids), so we
+    // cache id->name from the replayable 'lobby' roster to label the standings.
+    this._nameById = new Map();
+    // The standings panel DOM (built in start(), torn down in dispose()) and its
+    // per-kart row elements, keyed by kart id so we relabel/reorder in place
+    // (no per-frame DOM rebuild — just textContent + a flex `order` reshuffle).
+    this.standingsPanel = null;
+    this._standingsRows = new Map(); // id -> { row, left, lap, last, hi }
+    this._standingsTitle = null;     // header label, doubles as a connection state
+    this._standingsDot = null;       // header status dot (green live / amber lost)
+    // Connection watchdog state: time of the last snapshot and whether we've
+    // currently flagged the link as lost (so we toast the transition only once).
+    this._lastSnapTime = this._now();
+    this._connLost = false;
+
     // --- Projectile visual pool ------------------------------------------
     // We do NOT simulate projectiles on the client. Each snapshot lists the live
     // projectiles ({id,type,x,y,z}); we just place a few reusable meshes at those
@@ -178,6 +202,20 @@ export class MultiplayerRace {
     // Final standings.
     this._offs.push(this.socket.onEvent('raceEnd', (payload) => this._onRaceEnd(payload)));
 
+    // Roster names for the live standings. Snapshots/startGrid are id-only, but
+    // the 'lobby' payload carries {id,name}. 'lobby' is replayable, so even though
+    // the Lobby screen has been disposed by the time we wire up, SocketClient
+    // replays the last roster to this late subscriber. Names may also update mid-
+    // session (a join/ready broadcast), so we refresh the labels on each one.
+    this._offs.push(this.socket.onEvent('lobby', (payload) => {
+      if (this.disposed) return;
+      const players = (payload && payload.players) || [];
+      for (const p of players) {
+        if (p && p.id != null) this._nameById.set(p.id, p.name || 'Racer');
+      }
+      this._updateStandings();
+    }));
+
     // A human dropped mid-race and the server handed their kart to an AI — toast it
     // through the existing reward banner so everyone sees who left.
     this._offs.push(this.socket.onEvent('playerLeft', (p) => {
@@ -225,6 +263,13 @@ export class MultiplayerRace {
 
     // If we can already tell which kart is ours, set up the Predictor for it.
     this._ensurePredictor(payload.startGrid);
+
+    // Build the live standings panel now that we know the full field.
+    this._buildStandings();
+
+    // The first snapshot resets this, but seed it here so the watchdog doesn't
+    // fire during the pre-race countdown before any snapshot has arrived.
+    this._lastSnapTime = this._now();
   }
 
   /**
@@ -290,6 +335,19 @@ export class MultiplayerRace {
     if (!snap) return;
     this.lastSnapshot = snap;
 
+    // CONNECTION WATCHDOG: a snapshot just arrived, so the link is alive. Record
+    // when, and if we had previously flagged the connection as lost, clear that
+    // state and toast the recovery (the green default tone vs the alert tone the
+    // loss used). render() owns the loss-detection side of this watchdog.
+    this._lastSnapTime = this._now();
+    if (this._connLost) {
+      this._connLost = false;
+      this._setConnState(false);
+      if (this.hud && typeof this.hud.showRewardBanner === 'function') {
+        this.hud.showRewardBanner('Reconnected');
+      }
+    }
+
     // Resolve our local id if we still don't know it (the ackSeq map is keyed by
     // player id; if the socket didn't hand us an id, we can't reconcile until we
     // know which kart is ours — the caller normally sets socket.id on 'joined').
@@ -317,6 +375,12 @@ export class MultiplayerRace {
       // local/remote. `ks.item` is the server's held-item id ('' when empty).
       this._infoById.set(ks.id, { lap: ks.lap, pos: ks.pos, item: ks.item });
     }
+
+    // Refresh the live standings from the freshly-cached lap/position data. Done
+    // here (snapshot rate ~20Hz) rather than per render frame: the order/laps only
+    // change when a snapshot arrives, so re-laying them out every frame would be
+    // wasted work on the 60fps-Chromebook floor we must not regress.
+    this._updateStandings();
   }
 
   /**
@@ -412,6 +476,21 @@ export class MultiplayerRace {
         });
       }
     }
+
+    // 5) CONNECTION WATCHDOG (loss side): if we've received at least one snapshot
+    //    but the stream has since gone quiet for CONN_LOST_SECS, the link is
+    //    effectively down (the Interpolator is just holding the last frame, a
+    //    silent freeze). Flag it once and tell the player — clearing happens in
+    //    _onSnapshot when the stream resumes. Skipped once finished so a normal
+    //    post-race snapshot stop never reads as a disconnect.
+    if (!this.finished && this.lastSnapshot && !this._connLost &&
+        this._now() - this._lastSnapTime > CONN_LOST_SECS) {
+      this._connLost = true;
+      this._setConnState(true);
+      if (this.hud && typeof this.hud.showRewardBanner === 'function') {
+        this.hud.showRewardBanner('Connection lost — reconnecting…', 'alert');
+      }
+    }
   }
 
   /**
@@ -436,6 +515,174 @@ export class MultiplayerRace {
       color: def.color,
       count: 1, // snapshot carries no charge count; show a single item
     };
+  }
+
+  // ------------------------------------------------------------------------
+  // Live standings panel (DOM/CSS only — cheap, low-quality-tier safe).
+  // ------------------------------------------------------------------------
+  /**
+   * Build the compact standings panel once, after the start grid is known. One
+   * row per kart is created up front (a color swatch + a name line + a lap line);
+   * thereafter _updateStandings only re-labels and reorders these existing rows
+   * via the flex `order` property, so there's no per-frame DOM churn. Pinned to
+   * the mid-left edge so it clears the HUD's top-left timer, bottom-left speed/
+   * coin pills, top-center lap/item slots, and bottom-right minimap.
+   * pointer-events-none so it never intercepts clicks (e.g. on the results card).
+   * @private
+   */
+  _buildStandings() {
+    if (this.standingsPanel || this.karts.size === 0) return;
+
+    const panel = document.createElement('div');
+    panel.id = 'mp-standings';
+    panel.className = [
+      'fixed', 'left-3', 'top-1/2', '-translate-y-1/2', 'z-20',
+      'pointer-events-none', 'select-none', 'text-white',
+      'w-44', 'max-w-[40vw]', 'max-h-[70vh]', 'overflow-hidden',
+      'rounded-2xl', 'px-3', 'py-2.5',
+      'bg-slate-900/60', 'ring-1', 'ring-white/10', 'backdrop-blur-sm',
+      'shadow-lg', 'shadow-black/40',
+      'flex', 'flex-col', 'gap-1',
+    ].join(' ');
+
+    // Header: a label that doubles as the connection state, plus a status dot.
+    const header = document.createElement('div');
+    header.className = 'flex items-center justify-between mb-0.5';
+    const title = document.createElement('span');
+    title.className = 'text-[0.6rem] font-bold tracking-[0.2em] text-slate-400';
+    title.textContent = 'STANDINGS';
+    const dot = document.createElement('span');
+    dot.className =
+      'inline-block w-2 h-2 rounded-full bg-emerald-400 shadow shadow-emerald-400/60';
+    header.appendChild(title);
+    header.appendChild(dot);
+    panel.appendChild(header);
+    this._standingsTitle = title;
+    this._standingsDot = dot;
+
+    // List body. Rows live here and reorder purely via CSS `order` (no DOM moves).
+    const list = document.createElement('div');
+    list.className = 'flex flex-col gap-1';
+    panel.appendChild(list);
+
+    let idx = 0;
+    for (const [id, rec] of this.karts) {
+      const row = document.createElement('div');
+      row.className = [
+        'flex', 'items-center', 'gap-2',
+        'px-2', 'py-1', 'rounded-lg', 'text-xs', 'leading-none',
+        'bg-slate-800/40',
+      ].join(' ');
+      row.style.order = String(idx + 1); // grid order until the first snapshot
+
+      // Kart color swatch so you can match a row to the kart on track (mirrors
+      // the lobby roster swatch).
+      const swatch = document.createElement('span');
+      swatch.className = 'shrink-0 inline-block w-2.5 h-2.5 rounded-full ring-1 ring-white/30';
+      swatch.style.backgroundColor = this._hex(rec.color);
+      row.appendChild(swatch);
+
+      // "{pos}. {name}" — grows to fill, truncates a long name rather than wrap.
+      const left = document.createElement('span');
+      left.className = 'flex-1 min-w-0 truncate font-semibold';
+      row.appendChild(left);
+
+      // Current lap "/" total, monospaced so the column stays aligned.
+      const lap = document.createElement('span');
+      lap.className = 'shrink-0 font-mono text-[0.65rem] text-slate-300';
+      row.appendChild(lap);
+
+      list.appendChild(row);
+      this._standingsRows.set(id, { row, left, lap, last: '', hi: false });
+      idx++;
+    }
+
+    document.body.appendChild(panel);
+    this.standingsPanel = panel;
+
+    // Initial fill (grid order; real positions/laps arrive with the first snapshot).
+    this._updateStandings();
+  }
+
+  /**
+   * Relabel + reorder the standings rows from the per-kart lap/position data
+   * cached in _infoById each snapshot. Cheap: a flex `order` write reshuffles
+   * without moving DOM nodes, and textContent is only rewritten when the row's
+   * text actually changes. The local player's row is highlighted once (it never
+   * stops being "us"). Safe to call before the panel exists (no-ops).
+   * @private
+   */
+  _updateStandings() {
+    if (!this.standingsPanel) return;
+    const total = this.totalLaps;
+    for (const [id, ui] of this._standingsRows) {
+      const info = this._infoById.get(id);
+      const rec = this.karts.get(id);
+      const pos = info && info.pos != null ? info.pos : null;
+      const lap = info && info.lap != null ? info.lap : 1;
+      const isMe = id === this.localId;
+
+      // Reorder via flex `order` (unknown position sinks to the bottom).
+      ui.row.style.order = String(pos != null ? pos : 99);
+
+      const posText = pos != null ? pos + '.' : '–';
+      const nameText = posText + ' ' + this._displayName(id, rec) + (isMe ? ' (you)' : '');
+      const lapText = Math.min(Math.max(lap, 1), total) + '/' + total;
+      const key = nameText + '|' + lapText;
+      if (ui.last !== key) {
+        ui.left.textContent = nameText;
+        ui.lap.textContent = lapText;
+        ui.last = key;
+      }
+
+      // Highlight our own row once localId is known (it never changes after).
+      if (isMe && !ui.hi) {
+        ui.row.classList.remove('bg-slate-800/40');
+        ui.row.classList.add('bg-cyan-500/20', 'ring-1', 'ring-cyan-400/40', 'font-bold');
+        ui.hi = true;
+      }
+    }
+  }
+
+  /**
+   * Display name for a kart id: the lobby roster name if known, else 'CPU' for an
+   * AI seat or 'Racer' for a human we have no name for yet.
+   * @private
+   */
+  _displayName(id, rec) {
+    const n = this._nameById.get(id);
+    if (n) return n;
+    return rec && rec.isAI ? 'CPU' : 'Racer';
+  }
+
+  /**
+   * Reflect the connection state in the standings header. On loss the label turns
+   * amber 'RECONNECTING…' with a pulsing amber dot; on recovery it returns to the
+   * neutral 'STANDINGS' label + green live dot. A persistent indicator that
+   * outlasts the transient reward-banner toast so the player isn't left guessing.
+   * @param {boolean} lost
+   * @private
+   */
+  _setConnState(lost) {
+    if (!this._standingsTitle || !this._standingsDot) return;
+    if (lost) {
+      this._standingsTitle.textContent = 'RECONNECTING…';
+      this._standingsTitle.classList.remove('text-slate-400');
+      this._standingsTitle.classList.add('text-amber-300');
+      this._standingsDot.classList.remove('bg-emerald-400', 'shadow-emerald-400/60');
+      this._standingsDot.classList.add('bg-amber-400', 'shadow-amber-400/70', 'animate-pulse');
+    } else {
+      this._standingsTitle.textContent = 'STANDINGS';
+      this._standingsTitle.classList.remove('text-amber-300');
+      this._standingsTitle.classList.add('text-slate-400');
+      this._standingsDot.classList.remove('bg-amber-400', 'shadow-amber-400/70', 'animate-pulse');
+      this._standingsDot.classList.add('bg-emerald-400', 'shadow-emerald-400/60');
+    }
+  }
+
+  /** Convert a 0xRRGGBB color number to a '#rrggbb' CSS string. @private */
+  _hex(n) {
+    return '#' + ((n >>> 0) & 0xffffff).toString(16).padStart(6, '0');
   }
 
   // ------------------------------------------------------------------------
@@ -601,6 +848,13 @@ export class MultiplayerRace {
     if (this.resultsScreen && this.resultsScreen.parentNode) {
       this.resultsScreen.parentNode.removeChild(this.resultsScreen);
     }
+
+    // Remove the live standings panel.
+    if (this.standingsPanel && this.standingsPanel.parentNode) {
+      this.standingsPanel.parentNode.removeChild(this.standingsPanel);
+    }
+    this.standingsPanel = null;
+    this._standingsRows.clear();
   }
 }
 

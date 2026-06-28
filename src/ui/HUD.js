@@ -299,8 +299,10 @@ export class HUD {
     this.aliveElement.innerHTML =
       '<span class="text-3xl font-bold">1</span>' +
       '<span class="text-lg font-semibold opacity-80"> ALIVE</span>';
-    // Cache the count span so update() refreshes only the number.
+    // Cache the count span + the label span so update() can refresh the number and
+    // swap the standing ("ALIVE" while the player is in -> "SPECTATING" once out).
     this.aliveCountElement = this.aliveElement.querySelector('span:nth-child(1)');
+    this.aliveLabelElement = this.aliveElement.querySelector('span:nth-child(2)');
     this.element.appendChild(this.aliveElement);
 
     // --- BATTLE match clock ----------------------------------------------
@@ -635,8 +637,12 @@ export class HUD {
    * @param {string} message  the text to flash, e.g. "COMEBACK! Star".
    * @param {string} [tone]   'alert' for an urgent amber->rose card (e.g. FINAL
    *                          LAP); anything else (default) is the reward green.
+   * @param {number} [holdSecs] how long the banner holds at full before fading
+   *                          (default 0.6s). A longer hold lets weightier beats —
+   *                          the battle match-start objective + a "you're out" —
+   *                          linger so they actually read.
    */
-  showRewardBanner(message, tone) {
+  showRewardBanner(message, tone, holdSecs) {
     // Lazily build the banner once and cache it. Centered upper-third so it clears
     // the held-item slot up top and the player's kart at screen center.
     //   absolute top-1/4 left-1/2 -translate-x-1/2 -> upper-center, above the kart
@@ -699,6 +705,7 @@ export class HUD {
     // `transform`, which would otherwise clobber the Tailwind `-translate-x-1/2`
     // class and render the banner shifted right by half its width. Setting it on
     // the fromTo carries it through the later `.to` steps (they don't touch x).
+    const hold = typeof holdSecs === 'number' && holdSecs >= 0 ? holdSecs : 0.6;
     this._rewardBannerTween
       .fromTo(
         el,
@@ -706,7 +713,7 @@ export class HUD {
         { xPercent: -50, scale: 1.1, opacity: 1, y: 0, duration: 0.25, ease: 'back.out(2.2)' }
       )
       .to(el, { scale: 1, duration: 0.15, ease: 'power2.out' })
-      .to(el, { opacity: 0, scale: 1.15, y: -14, duration: 0.4, ease: 'power2.in' }, '+=0.6');
+      .to(el, { opacity: 0, scale: 1.15, y: -14, duration: 0.4, ease: 'power2.in' }, '+=' + hold);
   }
 
   /**
@@ -1591,9 +1598,19 @@ export class HUD {
     }
     this.balloonsElement.innerHTML = html;
 
-    // Alive count, e.g. "3 ALIVE".
+    // Alive count, e.g. "3 ALIVE". Once the player is knocked OUT, the count reads
+    // as a standing instead of an ambient number: it becomes "{N} LEFT · SPECTATING"
+    // tinted rose, so the player instantly understands they're watching the finish
+    // (not still racing) — the confusing "why did the camera jump?" moment is gone.
     const alive = info.alive != null ? Math.max(0, Math.round(info.alive)) : 1;
     this.aliveCountElement.textContent = String(alive);
+    if (info.playerOut) {
+      this.aliveLabelElement.textContent = ' LEFT · SPECTATING';
+      this.aliveElement.classList.add('text-rose-300');
+    } else {
+      this.aliveLabelElement.textContent = ' ALIVE';
+      this.aliveElement.classList.remove('text-rose-300');
+    }
   }
 
   // _updateBattleClock(timeLeft) shows the remaining match time (seconds) as a
