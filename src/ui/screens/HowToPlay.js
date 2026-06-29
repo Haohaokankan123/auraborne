@@ -44,8 +44,8 @@ const MODE_INFO = {
   battle: {
     title: 'BALLOON BATTLE',
     accent: '#fb7185', accent2: '#ec4899', // rose -> pink (Menu Battle button)
-    desc: "You have 3 balloons. Grab items and HIT rivals to pop their balloons (a shell, bomb, or a solid ram pops one) — every pop is +1 to your SCORE. Lose all 3 and you bounce right back with a fresh set, so you're never out for long. Most pops when the timer ends wins!",
-    objective: 'Pop balloons to score. Ram rivals or hit them with items. You respawn when wiped out — most pops in 90s wins.',
+    desc: "You have 3 balloons. Grab items and HIT rivals to pop their balloons (a shell, bomb, or a solid ram pops one). Lose all 3 and you're OUT for good — last kart standing wins. The bots are fast and aggressive, so keep moving and pick your hits.",
+    objective: '3 balloons each. No respawns — lose them all and you spectate. Last kart standing wins.',
   },
   mp: {
     title: 'MULTIPLAYER',

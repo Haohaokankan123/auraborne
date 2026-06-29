@@ -484,6 +484,17 @@ export class ProjectileSystem {
    * @private
    */
   _surfaceAt(x, z, yHint, sHint) {
+    // BATTLE ARENA: the "track" is an Arena (flat floor, no trackId / surface
+    // profile). sampleSurface(undefined,...) resolves to the DEFAULT circuit and
+    // returns ITS hilly terrain height at the arena's coords — which spawned every
+    // shell/banana dozens of metres above or below the flat arena floor, making
+    // them INVISIBLE. A flat collider has no trackId, so detect that and ride the
+    // floor (y = floorY, default 0) instead. This is the single height choke point,
+    // so it fixes spawn AND per-frame flight for every projectile + trap at once.
+    if (this.track && this.track.trackId == null) {
+      const groundY = typeof this.track.floorY === 'number' ? this.track.floorY : 0;
+      return { groundY, s: sHint || 0 };
+    }
     const surf = sampleSurface(this.track.trackId, x, z, yHint, sHint);
     return { groundY: surf.groundY, s: surf.s };
   }

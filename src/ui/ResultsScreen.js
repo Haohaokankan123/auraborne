@@ -466,10 +466,20 @@ export class ResultsScreen {
     name.textContent = r.name;
     row.appendChild(name);
 
-    // Score = pops landed (the win metric), shown as a gold ★ tally.
+    // KILLS (★ pops landed) + balloons-left, or a red OUT badge for an eliminated kart.
+    const kills = document.createElement('span');
+    kills.className = 'text-sm font-bold tabular-nums text-amber-300';
+    kills.textContent = '★' + (r.score || 0);
+    row.appendChild(kills);
+
     const tally = document.createElement('span');
-    tally.className = 'text-base font-black tabular-nums text-amber-300';
-    tally.textContent = '★ ' + (r.score || 0);
+    if (r.eliminated || r.balloons <= 0) {
+      tally.className = 'w-14 text-right text-sm font-black tracking-wide text-rose-400';
+      tally.textContent = 'OUT';
+    } else {
+      tally.className = 'w-14 text-right text-base font-bold tabular-nums';
+      tally.textContent = '🎈×' + r.balloons;
+    }
     row.appendChild(tally);
 
     return row;
@@ -499,15 +509,18 @@ export class ResultsScreen {
     const list = Array.isArray(results) ? results : [];
     const me = list.find((r) => r.isPlayer);
     if (me) {
-      const pops = me.score || 0;
+      const kos = me.score || 0;
+      const survived = !(me.eliminated || me.balloons <= 0);
       this._summary.textContent =
-        'You placed ' + this._ordinal(me.place) + ' · ' + pops + ' pop' + (pops === 1 ? '' : 's');
+        (survived ? 'You placed ' + this._ordinal(me.place)
+                  : 'You were knocked out · ' + this._ordinal(me.place)) +
+        ' · ' + kos + ' KO' + (kos === 1 ? '' : 's');
     } else {
       this._summary.textContent = 'Battle complete';
     }
 
     // Headline: a gold VICTORY! when the player tops the board, else BATTLE OVER.
-    const won = !!(me && me.place === 1 && (me.score || 0) > 0);
+    const won = !!(me && me.place === 1 && !(me.eliminated || me.balloons <= 0));
     this._title.textContent = won ? 'VICTORY!' : 'BATTLE OVER';
     this._title.className = won ? this._titleClassVictory : this._titleClassBase;
 

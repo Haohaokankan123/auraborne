@@ -1611,21 +1611,25 @@ export class HUD {
       ? Math.min(Math.max(0, Math.round(info.balloons)), max)
       : max;
 
-    // Build the balloon row: a bright balloon for each remaining one, and a dimmed
-    // balloon for each lost one (slots stay visually stable), then the player's SCORE
-    // (★ pops landed) — central + big so they read their own progress at a glance.
+    // Top-center row. While ALIVE: a balloon per remaining one (dimmed for lost ones)
+    // + the player's KILL count (★). Once ELIMINATED: a clear SPECTATING badge instead,
+    // since the player has no balloons and is now flying the free spectator cam.
     let html = '';
-    for (let i = 0; i < max; i++) {
-      const lost = i >= balloons;
-      html += '<span class="' + (lost ? 'opacity-30 scale-90' : '') + '">🎈</span>';
-    }
-    if (info.score != null) {
-      html += '<span class="ml-3 text-amber-300 font-black tabular-nums">★' +
-        Math.max(0, Math.round(info.score)) + '</span>';
+    if (info.spectating) {
+      html = '<span class="text-lg font-black tracking-widest text-rose-300">👁 SPECTATING</span>';
+    } else {
+      for (let i = 0; i < max; i++) {
+        const lost = i >= balloons;
+        html += '<span class="' + (lost ? 'opacity-30 scale-90' : '') + '">🎈</span>';
+      }
+      if (info.score != null) {
+        html += '<span class="ml-3 text-amber-300 font-black tabular-nums">★' +
+          Math.max(0, Math.round(info.score)) + '</span>';
+      }
     }
     this.balloonsElement.innerHTML = html;
 
-    // Live standings leaderboard (top-right), sorted by score.
+    // Live standings leaderboard (top-right): survivors first, eliminated dimmed.
     this._updateBattleStandings(info.standings);
   }
 
@@ -1662,7 +1666,7 @@ export class HUD {
         '<span class="inline-block w-2.5 h-2.5 rounded-full ring-1 ring-white/40 shrink-0" ' +
         'style="background:' + this._battleColorCss(s.color) + '"></span>';
       const tally = s.down
-        ? '<span class="text-[10px] font-bold text-rose-300 tracking-wide">···</span>'
+        ? '<span class="text-[10px] font-black text-rose-400 tracking-wide">OUT</span>'
         : '<span class="text-[10px] opacity-70 tabular-nums">🎈' + s.balloons + '</span>';
       html +=
         '<div class="flex items-center gap-1.5 px-1.5 py-0.5 rounded-md text-xs ' + rowCls + dim + '">' +
