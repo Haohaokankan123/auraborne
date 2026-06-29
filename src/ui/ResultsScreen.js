@@ -435,10 +435,10 @@ export class ResultsScreen {
 
   /**
    * Build one BATTLE standings row: rank/medal + colour chip + name + the kart's
-   * balloons-left (or a red "OUT" for an eliminated kart). Mirrors _buildRow's
-   * look so the board reads consistently; the player's row is highlighted.
+   * SCORE (★ pops landed — the win metric). Mirrors _buildRow's look so the board
+   * reads consistently; the player's row is highlighted.
    * @param {{place:number, name:string, color:number|string, isPlayer:boolean,
-   *          balloons:number, eliminated:boolean}} r
+   *          score:number, balloons:number}} r
    * @returns {HTMLDivElement}
    * @private
    */
@@ -466,27 +466,22 @@ export class ResultsScreen {
     name.textContent = r.name;
     row.appendChild(name);
 
-    // Balloons left (🎈×N) or a red OUT badge for an eliminated kart.
+    // Score = pops landed (the win metric), shown as a gold ★ tally.
     const tally = document.createElement('span');
-    if (r.eliminated || r.balloons <= 0) {
-      tally.className = 'text-sm font-black tracking-wide text-rose-400';
-      tally.textContent = 'OUT';
-    } else {
-      tally.className = 'text-base font-bold tabular-nums';
-      tally.textContent = '🎈 ×' + r.balloons;
-    }
+    tally.className = 'text-base font-black tabular-nums text-amber-300';
+    tally.textContent = '★ ' + (r.score || 0);
     row.appendChild(tally);
 
     return row;
   }
 
   /**
-   * Show the BATTLE results board (balloon free-for-all). Ranks karts by
-   * balloons-remaining then survival order, medals the podium, highlights the
-   * player, and shows RESTART + MENU (NEXT TRACK is hidden — battles have no track
-   * picker). Reuses the single-race button row + entrance so it matches the rest.
+   * Show the BATTLE results board (balloon free-for-all). Ranks karts by SCORE
+   * (pops landed), medals the podium, highlights the player, and shows RESTART +
+   * MENU (NEXT TRACK is hidden — battles have no track picker). Reuses the
+   * single-race button row + entrance so it matches the rest.
    *
-   * @param {Array} results  leader-first [{place,name,color,isPlayer,balloons,eliminated}].
+   * @param {Array} results  leader-first [{place,name,color,isPlayer,score,balloons}].
    * @param {{onRestart?:Function, onMenu?:Function}} handlers
    */
   showBattle(results, { onRestart, onMenu } = {}) {
@@ -494,9 +489,8 @@ export class ResultsScreen {
     this._onNextTrack = () => {};
     this._onMenu = onMenu || (() => {});
 
-    // Single-race button row, but hide NEXT TRACK (no track to advance to).
-    this._title.textContent = 'BATTLE OVER';
-    this._title.className = this._titleClassBase; // reset any prior gold VICTORY look
+    // Single-race button row, but hide NEXT TRACK (no track to advance to). The
+    // headline (BATTLE OVER vs the gold VICTORY!) is set below once we know the place.
     this._setRivalLine(''); // battles have no rival duel
     this._buttonRow.style.display = 'flex';
     this._cupButtonRow.style.display = 'none';
@@ -505,12 +499,17 @@ export class ResultsScreen {
     const list = Array.isArray(results) ? results : [];
     const me = list.find((r) => r.isPlayer);
     if (me) {
-      this._summary.textContent = (me.eliminated || me.balloons <= 0)
-        ? 'You were knocked out · ' + this._ordinal(me.place)
-        : 'You placed ' + this._ordinal(me.place) + ' · ' + me.balloons + ' balloons left';
+      const pops = me.score || 0;
+      this._summary.textContent =
+        'You placed ' + this._ordinal(me.place) + ' · ' + pops + ' pop' + (pops === 1 ? '' : 's');
     } else {
       this._summary.textContent = 'Battle complete';
     }
+
+    // Headline: a gold VICTORY! when the player tops the board, else BATTLE OVER.
+    const won = !!(me && me.place === 1 && (me.score || 0) > 0);
+    this._title.textContent = won ? 'VICTORY!' : 'BATTLE OVER';
+    this._title.className = won ? this._titleClassVictory : this._titleClassBase;
 
     this._list.innerHTML = '';
     const rows = [];

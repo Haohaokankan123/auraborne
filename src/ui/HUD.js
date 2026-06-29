@@ -305,6 +305,24 @@ export class HUD {
     this.aliveLabelElement = this.aliveElement.querySelector('span:nth-child(2)');
     this.element.appendChild(this.aliveElement);
 
+    // --- BATTLE live standings (score leaderboard) -----------------------
+    // A compact top-right panel listing every kart sorted by SCORE (pops landed),
+    // with a colour chip, name, ★score and 🎈balloons. The player's row is
+    // highlighted so they can read their place at a glance — the competitive
+    // readout the score-battle mode needs. Shown only in battle (_updateBattle).
+    // We only rewrite its DOM when the data changes (see _standingsSig), so it's
+    // cheap to feed every frame. Replaces the old bare "N ALIVE" count.
+    this.battleStandingsElement = document.createElement('div');
+    this.battleStandingsElement.id = 'hud-battle-standings';
+    this.battleStandingsElement.className =
+      'absolute top-3 right-4 w-56 flex flex-col gap-1 ' +
+      'p-2 rounded-xl bg-slate-900/55 backdrop-blur-sm ring-1 ring-white/15 ' +
+      'shadow-lg shadow-black/30 hidden';
+    this.element.appendChild(this.battleStandingsElement);
+    // Cache of the last-rendered standings signature so unchanged frames skip the
+    // innerHTML rebuild (avoids layout thrash at 120-240fps).
+    this._standingsSig = null;
+
     // --- BATTLE match clock ----------------------------------------------
     // A mm:ss countdown of the remaining battle time, top-center under the
     // balloon row. It PULSES red in the final 10 seconds so the urgency reads.
@@ -1097,6 +1115,7 @@ export class HUD {
     // race-only elements are visible (in case we switched modes mid-session).
     this.balloonsElement.classList.add('hidden');
     this.aliveElement.classList.add('hidden');
+    this.battleStandingsElement.classList.add('hidden');
     this.battleClockElement.classList.add('hidden');
     this.lapElement.classList.remove('hidden');
     this.positionElement.classList.remove('hidden');
@@ -1579,9 +1598,10 @@ export class HUD {
     // feedback, and each self-hides when idle — no clutter when unused.)
     this.trickElement.classList.add('hidden');
 
-    // Show the battle elements.
+    // Show the battle elements (balloon row + standings panel). The old bare "N ALIVE"
+    // count is replaced by the richer standings leaderboard, so keep it hidden.
     this.balloonsElement.classList.remove('hidden');
-    this.aliveElement.classList.remove('hidden');
+    this.aliveElement.classList.add('hidden');
 
     // Match clock: mm:ss remaining, pulsing red in the final 10 seconds.
     this._updateBattleClock(info.timeLeft);
@@ -1591,29 +1611,83 @@ export class HUD {
       ? Math.min(Math.max(0, Math.round(info.balloons)), max)
       : max;
 
-    // Build the balloon row: a bright balloon for each remaining one, and a
-    // dimmed balloon for each lost one (so the slots stay visually stable).
+    // Build the balloon row: a bright balloon for each remaining one, and a dimmed
+    // balloon for each lost one (slots stay visually stable), then the player's SCORE
+    // (★ pops landed) — central + big so they read their own progress at a glance.
     let html = '';
     for (let i = 0; i < max; i++) {
       const lost = i >= balloons;
-      // 🎈 balloon emoji; lost ones are faded + slightly shrunk.
       html += '<span class="' + (lost ? 'opacity-30 scale-90' : '') + '">🎈</span>';
+    }
+    if (info.score != null) {
+      html += '<span class="ml-3 text-amber-300 font-black tabular-nums">★' +
+        Math.max(0, Math.round(info.score)) + '</span>';
     }
     this.balloonsElement.innerHTML = html;
 
-    // Alive count, e.g. "3 ALIVE". Once the player is knocked OUT, the count reads
-    // as a standing instead of an ambient number: it becomes "{N} LEFT · SPECTATING"
-    // tinted rose, so the player instantly understands they're watching the finish
-    // (not still racing) — the confusing "why did the camera jump?" moment is gone.
-    const alive = info.alive != null ? Math.max(0, Math.round(info.alive)) : 1;
-    this.aliveCountElement.textContent = String(alive);
-    if (info.playerOut) {
-      this.aliveLabelElement.textContent = ' LEFT · SPECTATING';
-      this.aliveElement.classList.add('text-rose-300');
-    } else {
-      this.aliveLabelElement.textContent = ' ALIVE';
-      this.aliveElement.classList.remove('text-rose-300');
+    // Live standings leaderboard (top-right), sorted by score.
+    this._updateBattleStandings(info.standings);
+  }
+
+  // _updateBattleStandings(standings): render/refresh the top-right battle leaderboard.
+  // `standings` is the field sorted best-first: [{id,name,color,isPlayer,score,balloons,down}].
+  // We only rewrite the DOM when the data changes (signature gate) so feeding it every
+  // frame is cheap. The player's row is highlighted; a downed kart dims + shows "···".
+  _updateBattleStandings(standings) {
+    const el = this.battleStandingsElement;
+    if (!Array.isArray(standings) || standings.length === 0) {
+      el.classList.add('hidden');
+      return;
     }
+    el.classList.remove('hidden');
+
+    // Signature: skip the rebuild when nothing visible changed.
+    let sig = '';
+    for (let i = 0; i < standings.length; i++) {
+      const s = standings[i];
+      sig += s.id + ':' + s.score + ':' + s.balloons + ':' + (s.down ? 1 : 0) + '|';
+    }
+    if (sig === this._standingsSig) return;
+    this._standingsSig = sig;
+
+    let html =
+      '<div class="text-[10px] font-bold tracking-[0.2em] text-white/55 px-1">STANDINGS</div>';
+    for (let i = 0; i < standings.length; i++) {
+      const s = standings[i];
+      const rowCls = s.isPlayer
+        ? 'bg-cyan-500/25 ring-1 ring-cyan-300/70 text-cyan-100'
+        : 'bg-slate-800/40 ring-1 ring-white/10 text-slate-100';
+      const dim = s.down ? ' opacity-50' : '';
+      const chip =
+        '<span class="inline-block w-2.5 h-2.5 rounded-full ring-1 ring-white/40 shrink-0" ' +
+        'style="background:' + this._battleColorCss(s.color) + '"></span>';
+      const tally = s.down
+        ? '<span class="text-[10px] font-bold text-rose-300 tracking-wide">···</span>'
+        : '<span class="text-[10px] opacity-70 tabular-nums">🎈' + s.balloons + '</span>';
+      html +=
+        '<div class="flex items-center gap-1.5 px-1.5 py-0.5 rounded-md text-xs ' + rowCls + dim + '">' +
+        '<span class="w-3 text-center font-black tabular-nums opacity-60">' + (i + 1) + '</span>' +
+        chip +
+        '<span class="flex-1 truncate font-semibold">' + this._escapeName(s.name) + '</span>' +
+        '<span class="font-black tabular-nums text-amber-300">★' + s.score + '</span>' +
+        tally +
+        '</div>';
+    }
+    el.innerHTML = html;
+  }
+
+  // _battleColorCss(c): a kart's body colour as a CSS string. Numbers are treated as
+  // 0xRRGGBB hex ints (the battle palette); anything else passes through as-is.
+  _battleColorCss(c) {
+    if (typeof c === 'number') return '#' + ((c >>> 0) & 0xffffff).toString(16).padStart(6, '0');
+    return c || '#ffffff';
+  }
+
+  // _escapeName(n): minimal HTML-escape for a kart name dropped into innerHTML, so a
+  // stray character in a future custom name can never break the markup.
+  _escapeName(n) {
+    return String(n == null ? '' : n)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
   // _updateBattleClock(timeLeft) shows the remaining match time (seconds) as a

@@ -44,11 +44,21 @@ import {
 } from '../../shared/kartModel.js';
 
 // --- Battle tuning (local to this mode; not shared kart physics) -------------
-const START_BALLOONS = 3;        // balloons each kart begins with
-const TIME_LIMIT = 120;          // s  hard cap; highest balloon count wins at 0
+const START_BALLOONS = 3;        // balloons each kart begins (and respawns) with
+const TIME_LIMIT = 90;           // s  match length; MOST POPS (score) wins at 0
 const HIT_POP_SPIN = 1.0;        // s  brief spin applied as the balloon-pop reaction
 const SPIN_EDGE_EPS = 0.05;      // s  spinTimer above this counts as "freshly hit"
 const ITEM_BOX_RESPAWN_HINT = 3; // (boxes respawn via ItemBoxManager's own timer)
+
+// SCORE + RESPAWN (the headline mode change). Balloon Battle is now a TIMED SCORE
+// race, not last-kart-standing: popping a rival's balloon is +1 to your SCORE; when
+// your last balloon goes you're briefly DOWN, then RESPAWN with a fresh set (so you
+// never sit out the match watching) — but a wipeout costs you a point. Highest score
+// at TIME_LIMIT wins. This keeps all 8 karts fighting the whole match and rewards
+// aggression, instead of the old "get popped early, spectate for 2 minutes" dead time.
+const RESPAWN_DELAY = 1.6;       // s  downed -> back in, pre-positioned at a safe spawn
+const SPAWN_PROTECT = 2.5;       // s  post-respawn invulnerability (can't pop / be popped); kart blinks
+const WIPEOUT_PENALTY = 1;       // score lost when your last balloon pops (floored at 0)
 
 // RAM-to-pop tuning (client-only bumper-car combat; never touches shared physics).
 const RAM_CONTACT = 3.0;         // m   center distance counting as a body-to-body hit (forgiving so "drive into them" connects)
@@ -158,7 +168,7 @@ export class Battle {
     // confetti play, then flip `finished` so main.js shows the polished board.
     this._ending = false;      // true during the brief end flourish (sim frozen).
     this._endTimer = 0;        // seconds left in the flourish before results.
-    this._endReason = null;    // 'timeout' | 'lastStanding' (shapes the banner).
+    this._endReason = null;    // 'timeout' (the only end condition now; shapes the banner).
     // Monotonic knockout counter -> survival ranking (later out = better place).
     this._knockoutSeq = 0;
     // Last integer second we beeped, so the final-10s countdown beeps once/second.
@@ -265,7 +275,13 @@ export class Battle {
         balloons: START_BALLOONS,
         balloonMeshes,
         alive: true,
-        outOrder: 0,      // knockout sequence (0 = still alive); higher = out later
+        // SCORE = balloons this kart has popped on others (the win metric). RESPAWN
+        // bookkeeping: _downTimer counts the brief "wiped out" beat before coming back,
+        // _spawnProtectUntil is the battle-clock time the post-respawn invuln expires.
+        score: 0,
+        _downTimer: 0,
+        _spawnProtectUntil: 0,
+        outOrder: 0,      // knockout sequence (0 = still alive); higher = out later (tie-break only)
 
         // Previous-tick spinTimer, for the rising-edge "just got hit" detection.
         prevSpin: 0,
@@ -413,9 +429,9 @@ export class Battle {
       this._objectiveShown = true;
       if (this.hud && typeof this.hud.showRewardBanner === 'function') {
         this.hud.showRewardBanner(
-          '🎈 POP THEIR BALLOONS — ram rivals at speed, or hit them with items (SHIFT or CLICK)',
+          '🎈 POP TO SCORE — ram rivals or hit them with items (SHIFT / CLICK). Most pops in 90s wins!',
           'alert',
-          1.8
+          2.0
         );
       }
     }
@@ -429,6 +445,16 @@ export class Battle {
       if (this.audio && typeof this.audio.sfxCountdown === 'function') {
         this.audio.sfxCountdown(Math.max(1, Math.min(3, secsLeft)));
       }
+    }
+
+    // RESPAWN: bring back any DOWNED kart once its short respawn beat elapses, so the
+    // field stays full and nobody spectates. Done BEFORE the alive list is built so a
+    // kart that comes back this tick rejoins combat immediately (with spawn protection).
+    for (let i = 0; i < this.karts.length; i++) {
+      const rec = this.karts[i];
+      if (rec.alive || rec._downTimer <= 0) continue;
+      rec._downTimer -= dt;
+      if (rec._downTimer <= 0) this._respawn(rec);
     }
 
     // Live combat list = only karts that still have balloons. ItemBox/Projectile
@@ -697,6 +723,7 @@ export class Battle {
         if (approach < RAM_APPROACH) continue; // glancing / drafting — not a real crash
         const vs = victim.state;
         if (now < (victim._ramCooldownUntil || 0)) continue; // still in pop cooldown
+        if (now < (victim._spawnProtectUntil || 0)) continue; // just respawned — invulnerable
         if (vs.spinTimer > SPIN_EDGE_EPS || isInvincible(vs)) continue; // mid-pop / starred
         vs.spinTimer = HIT_POP_SPIN;          // -> a pop in _resolveBalloonHits
         victim.poppedBy = attacker.id;        // attribution for the scoring cue
@@ -786,6 +813,14 @@ export class Battle {
         s.spinTimer = 0;
         continue;
       }
+      // Freshly respawned: invulnerable. Eat the hit (clear the spin) — no pop. This is
+      // the single choke point for ALL pops (ram + projectile + specials), so guarding
+      // here covers every source of damage against a protected kart.
+      if (this.clock < (rec._spawnProtectUntil || 0)) {
+        s.spinTimer = 0;
+        rec.poppedBy = null;
+        continue;
+      }
       // Trim the spin to a brief pop reaction.
       if (s.spinTimer > HIT_POP_SPIN) s.spinTimer = HIT_POP_SPIN;
       // Credit a projectile pop to the player if (and only if) one of the player's
@@ -819,22 +854,28 @@ export class Battle {
     // player spin-edge hook, so we don't duplicate it here.
     if (this.audio && typeof this.audio.sfxPop === 'function') this.audio.sfxPop();
 
+    // SCORE: the popper earns a point for every balloon they burst (player AND bots —
+    // bots compete for the win too). poppedBy is the attacker id from the ram pass /
+    // projectile credit / a player special; ignore self-pops (shouldn't happen).
+    const scoredByPlayer = rec.poppedBy === 'player';
+    const attacker = rec.poppedBy ? this._kartById.get(rec.poppedBy) : null;
+    if (attacker && attacker.id !== rec.id) attacker.score += 1;
+
     // READABLE CUE so every balloon change is understood (the feedback loop the
     // player said was missing). When the player LOSES one: an urgent "-1" cue (the
     // red screen flash already comes from main.js). When the player SCORES one off
-    // a rival: a green "POP!" confirm naming the victim. Suppressed on the KILLING
-    // pop — _knockOut's banner says it better and would otherwise be clobbered.
-    const scoredByPlayer = rec.poppedBy === 'player';
+    // a rival: a green "+1" confirm naming the victim. Suppressed on the KILLING
+    // pop — _downKart's banner says it better and would otherwise be clobbered.
     if (rec.balloons > 0 && this.hud && typeof this.hud.showRewardBanner === 'function') {
       if (rec.isPlayer) {
         this.hud.showRewardBanner('POP!  -1 balloon', 'alert');
       } else if (scoredByPlayer) {
-        this.hud.showRewardBanner('POP! 🎈  ' + this._displayName(rec) + ' -1');
+        this.hud.showRewardBanner('POP! 🎈 +1  ' + this._displayName(rec));
       }
     }
 
     if (rec.balloons <= 0) {
-      this._knockOut(rec, scoredByPlayer);
+      this._downKart(rec, scoredByPlayer);
     }
     // Attribution is single-use: clear it so a later pop from another source can't
     // inherit a stale "scored by" credit.
@@ -842,44 +883,103 @@ export class Battle {
   }
 
   /**
-   * Knock a kart out of the battle: mark it dead, hide its whole visual, and drop
-   * any held item. It stays in this.karts (for the final tally) but is filtered
-   * out of every combat list by _aliveKarts().
+   * Wipe out a kart whose last balloon just popped: take it out of play for a brief
+   * beat (hidden, items dropped, score penalised), pre-position it at a SAFE respawn
+   * spawn so the camera can settle there, and arm its respawn countdown. _respawn()
+   * brings it back with a fresh set of balloons + spawn protection. The record stays
+   * in this.karts (filtered out of combat by _aliveKarts while down).
    * @param {object} rec
    * @param {boolean} [scoredByPlayer]  the player landed the finishing pop.
    * @private
    */
-  _knockOut(rec, scoredByPlayer = false) {
+  _downKart(rec, scoredByPlayer = false) {
     rec.alive = false;
-    rec.outOrder = ++this._knockoutSeq; // later knockout = survived longer = better place
+    rec.outOrder = ++this._knockoutSeq; // tie-break only: later wipeout = ranked higher on equal score
     rec.kart.group.visible = false;
     this.itemSystem.clear(rec.id);
+    // A wipeout costs a point (floored at 0) so it stings — being aggressive without
+    // dying is what climbs the board, not trading pops 1-for-1.
+    rec.score = Math.max(0, rec.score - WIPEOUT_PENALTY);
+    rec._downTimer = RESPAWN_DELAY;
+
+    // Pre-position at the safest free spawn NOW (while hidden). The chase camera then
+    // glides to the respawn point over the down beat, so the player reappears framed —
+    // no jarring jump from the death spot when the kart pops back in.
+    const pose = this._pickRespawnPose(rec);
+    rec.state.x = pose.x; rec.state.y = pose.y; rec.state.z = pose.z;
+    rec.state.heading = pose.heading; rec.state.speed = 0;
+    const pt = rec.prevTransform;
+    pt.x = pose.x; pt.y = pose.y; pt.z = pose.z; pt.heading = pose.heading;
+    rec._lastX = null; rec._lastZ = null; // reset anti-stuck baseline
 
     const canBanner = this.hud && typeof this.hud.showRewardBanner === 'function';
-
-    // THE PLAYER'S OWN ELIMINATION is always announced, loud and distinct — even
-    // when it's the match-decider (the camera is about to pan to a survivor, which
-    // is otherwise a confusing silent jump). A bold, longer alert banner + a red
-    // screen wash so "you're out, now spectating" is unmissable.
     if (rec.isPlayer) {
-      if (canBanner) this.hud.showRewardBanner("YOU'RE OUT — spectating", 'alert', 1.6);
+      // The player's own wipeout: clear, but reassuring — they're coming RIGHT back.
+      if (canBanner) this.hud.showRewardBanner('💥 WIPED OUT — respawning…', 'alert', 1.4);
       if (typeof this.hud._pulseFlash === 'function') {
         this.hud._pulseFlash('rgba(244, 63, 94, 0.5)', 0.5, 0.6); // rose-500 wash
       }
       return;
     }
-
-    // ELIMINATION FEED for a bot: a brief centered toast naming who's out (and
-    // crediting the player when they landed it, to reward aggression). Skip when
-    // the knockout IS the match-ender — _beginEnding's win banner says it better
-    // and would otherwise be clobbered the same frame.
-    const aliveLeft = this.getAliveCount();
-    if (aliveLeft > 1 && canBanner) {
+    // Bot wipeout feed: name who went down, crediting the player when they landed it.
+    if (canBanner) {
       const who = this._displayName(rec);
       this.hud.showRewardBanner(
-        scoredByPlayer ? '💥 You knocked out ' + who + '!' : '💥 ' + who + ' knocked out!'
+        scoredByPlayer ? '💥 You wiped out ' + who + '!  +1' : '💥 ' + who + ' wiped out!'
       );
     }
+  }
+
+  /**
+   * Bring a downed kart back into play: re-inflate its balloons, re-show its visual,
+   * zero its combat state, and grant a brief spawn-protection window (can't pop or be
+   * popped; the kart blinks in render). Its pose was already set at wipeout time.
+   * @param {object} rec
+   * @private
+   */
+  _respawn(rec) {
+    rec.balloons = START_BALLOONS;
+    for (let i = 0; i < rec.balloonMeshes.length; i++) rec.balloonMeshes[i].visible = true;
+    rec.kart.group.visible = true;
+    rec.alive = true;
+    rec._downTimer = 0;
+    rec.prevSpin = 0;
+    rec.poppedBy = null;
+    rec._ramCooldownUntil = 0;
+    rec.state.spinTimer = 0;
+    rec.state.speed = 0;
+    rec._spawnProtectUntil = this.clock + SPAWN_PROTECT;
+    if (rec.isPlayer && this.hud && typeof this.hud.showRewardBanner === 'function') {
+      this.hud.showRewardBanner('🛡 BACK IN — go pop some balloons!', 'alert', 1.2);
+    }
+  }
+
+  /**
+   * Pick the safest spawn pose for a respawning kart: of the arena's fixed spawn
+   * points, the one whose nearest OTHER alive kart is farthest away — so a kart never
+   * comes back on top of a rival. Falls back to spawn[0] if none stand out.
+   * @param {object} rec
+   * @returns {{x:number,y:number,z:number,heading:number}}
+   * @private
+   */
+  _pickRespawnPose(rec) {
+    const spawns = this.arena.spawnPoints;
+    let best = spawns[0];
+    let bestClearance = -Infinity;
+    for (let i = 0; i < spawns.length; i++) {
+      const sp = spawns[i];
+      let nearest = Infinity;
+      for (let j = 0; j < this.karts.length; j++) {
+        const o = this.karts[j];
+        if (o === rec || !o.alive) continue;
+        const dx = o.state.x - sp.x;
+        const dz = o.state.z - sp.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < nearest) nearest = d2;
+      }
+      if (nearest > bestClearance) { bestClearance = nearest; best = sp; }
+    }
+    return best;
   }
 
   /**
@@ -896,31 +996,28 @@ export class Battle {
   }
 
   /**
-   * Decide the battle outcome. Win conditions:
-   *   - exactly one kart still has balloons -> that kart wins, OR
-   *   - the time limit elapsed -> the kart with the most balloons wins (first by
-   *     balloon count; ties broken by id order, which is fine for a casual mode).
-   * On a decision we set finished + winnerId and show the result overlay.
+   * Decide the battle outcome. With respawns the field never empties, so the ONLY
+   * end condition is the clock: when TIME_LIMIT elapses, the highest SCORE (pops
+   * landed) wins — ties broken by balloons currently held, then by surviving longest
+   * since the last wipeout (outOrder). On a decision we set winnerId + begin the
+   * end flourish.
    * @private
    */
   _checkWinner() {
     if (this._ending || this.finished) return;
-    const alive = this._aliveKarts();
+    if (this.clock < TIME_LIMIT) return;
 
-    if (alive.length <= 1) {
-      this.winnerId = alive.length === 1 ? alive[0].id : null;
-      this._beginEnding('lastStanding');
-      return;
-    }
-    if (this.clock >= TIME_LIMIT) {
-      // Most balloons wins; first max in record order takes ties.
-      let best = alive[0];
-      for (let i = 1; i < alive.length; i++) {
-        if (alive[i].balloons > best.balloons) best = alive[i];
+    let best = this.karts[0];
+    for (let i = 1; i < this.karts.length; i++) {
+      const r = this.karts[i];
+      if (r.score > best.score) { best = r; continue; }
+      if (r.score === best.score) {
+        if (r.balloons > best.balloons) { best = r; continue; }
+        if (r.balloons === best.balloons && r.outOrder > best.outOrder) best = r;
       }
-      this.winnerId = best.id;
-      this._beginEnding('timeout');
     }
+    this.winnerId = best ? best.id : null;
+    this._beginEnding('timeout');
   }
 
   /**
@@ -928,26 +1025,26 @@ export class Battle {
    * banner, and let the win celebration (confetti + fanfare, fired by main.js on
    * the `finished` edge) play. After a short beat, _finish() flips `finished` so
    * the polished results board is shown by the mode router.
-   * @param {'timeout'|'lastStanding'} reason  why the match ended (shapes the banner).
+   * @param {'timeout'} reason  why the match ended (always 'timeout' now; shapes the banner).
    * @private
    */
   _beginEnding(reason) {
     if (this._ending || this.finished) return;
     this._ending = true;
     this._endReason = reason;
-    this._endTimer = 1.4; // s — banner + confetti beat before the board
+    this._endTimer = 1.6; // s — banner + confetti beat before the board
 
-    // Banner: a clear, kid-friendly outcome. Timeout leads with "TIME!".
+    // Banner: a clear, kid-friendly outcome naming the winning pop count.
+    const winner = this.winnerId ? this._kartById.get(this.winnerId) : null;
     const playerWon = this.winnerId === 'player';
+    const pops = winner ? winner.score : 0;
     let msg;
-    if (this.winnerId == null) {
-      msg = reason === 'timeout' ? "TIME! It's a draw!" : "It's a draw!";
+    if (!winner || pops === 0) {
+      msg = "⏱ TIME! No pops — it's a draw!";
     } else if (playerWon) {
-      msg = reason === 'timeout' ? '⏱ TIME! You win!' : '🎉 You win!';
+      msg = '⏱ TIME! You win — ' + pops + ' pop' + (pops === 1 ? '' : 's') + '!';
     } else {
-      const winner = this._kartById.get(this.winnerId);
-      const who = winner ? this._displayName(winner) : 'CPU';
-      msg = (reason === 'timeout' ? 'TIME! ' : '') + who + ' wins';
+      msg = '⏱ TIME! ' + this._displayName(winner) + ' wins — ' + pops + ' pops';
     }
     if (this.hud && typeof this.hud.showRewardBanner === 'function') {
       this.hud.showRewardBanner(msg);
@@ -977,21 +1074,18 @@ export class Battle {
   }
 
   /**
-   * Build the final standings for the results board, best-first. Ranking:
-   *   1) karts still holding balloons, by balloons DESC, then
-   *   2) eliminated karts by SURVIVAL (later knockout = better),
-   * so the last kart out beats the first kart out. Each entry carries what the
-   * board needs: place, display name, colour chip, isPlayer, balloons, eliminated.
+   * Build the final standings for the results board, best-first. Ranking is by
+   * SCORE (pops landed) DESC, then by balloons currently held, then by surviving
+   * longest since the last wipeout — matching _checkWinner's winner pick. Each entry
+   * carries what the board needs: place, name, colour chip, isPlayer, score, balloons.
    * @returns {Array<{place:number,id:string,name:string,color:number,
-   *                   isPlayer:boolean,balloons:number,eliminated:boolean}>}
+   *                   isPlayer:boolean,score:number,balloons:number,eliminated:boolean}>}
    */
   getBattleResults() {
     const ranked = this.karts.slice().sort((a, b) => {
-      const aOut = a.balloons <= 0;
-      const bOut = b.balloons <= 0;
-      if (aOut !== bOut) return aOut ? 1 : -1;       // survivors above the eliminated
-      if (!aOut) return b.balloons - a.balloons;      // both alive: more balloons first
-      return b.outOrder - a.outOrder;                 // both out: later knockout first
+      if (b.score !== a.score) return b.score - a.score;         // most pops first
+      if (b.balloons !== a.balloons) return b.balloons - a.balloons; // then balloons held
+      return b.outOrder - a.outOrder;                            // then survived longest
     });
     return ranked.map((rec, i) => ({
       place: i + 1,
@@ -999,8 +1093,9 @@ export class Battle {
       name: this._displayName(rec),
       color: rec.color,
       isPlayer: rec.isPlayer,
+      score: rec.score,
       balloons: Math.max(0, rec.balloons),
-      eliminated: rec.balloons <= 0,
+      eliminated: rec.balloons <= 0, // (transient — a kart can be mid-respawn at TIME)
     }));
   }
 
@@ -1328,11 +1423,19 @@ export class Battle {
       rec.kart.syncFromState(rs, DT, steer);
       // Gently bob the remaining balloons so they read as floating.
       this._animateBalloons(rec, DT);
+      // SPAWN-PROTECT BLINK: a freshly respawned kart flickers (~12Hz) while invulnerable
+      // so its "can't be touched yet" state reads at a glance, then settles solid.
+      if (this.clock < rec._spawnProtectUntil) {
+        rec.kart.group.visible = Math.floor(this.clock * 12) % 2 === 0;
+      } else if (!rec.kart.group.visible) {
+        rec.kart.group.visible = true; // protection just ended — make sure it's solid
+      }
     }
 
-    // 2) Chase camera: follow the player if alive, else any survivor so the
-    //    knocked-out player still sees the finish. Use the interpolated transform
-    //    so the camera tracks the smoothed kart, not the discrete 60Hz one.
+    // 2) Chase camera: ALWAYS follow the player (it's pre-positioned at its respawn
+    //    point the instant it's wiped out, so the camera glides there during the brief
+    //    down beat — no jarring jump to a survivor and back). Falls back to a survivor
+    //    only if there's somehow no player record. Interpolated transform = smooth track.
     const cameraTarget = this._cameraTarget();
     if (cameraTarget && this.renderer &&
         typeof this.renderer.updateChaseCamera === 'function') {
@@ -1340,21 +1443,18 @@ export class Battle {
       this.renderer.updateChaseCamera(camRs, DT);
     }
 
-    // 3) HUD: show the player's remaining balloons + how many karts are alive.
+    // 3) HUD: the player's balloons + SCORE + a live standings panel of the field.
     if (this.hud) {
       const player = this._kartById.get('player');
-      const alive = this._aliveKarts();
       if (player) {
-        // M6: feed the HUD's dedicated BATTLE layout (balloon icons + ALIVE count)
-        // instead of the old lap/position misuse. mode:'battle' switches the HUD.
+        // M6: feed the HUD's dedicated BATTLE layout. mode:'battle' switches the HUD.
         this.hud.update(player.state, {
           mode: 'battle',
           balloons: player.balloons,
           maxBalloons: START_BALLOONS,
-          alive: alive.length,
-          // Once the player is out, the HUD swaps the survivor count to a
-          // "SPECTATING" standing so they know they're watching, not playing.
-          playerOut: player.balloons <= 0,
+          score: player.score,                       // the player's pop count (the win metric)
+          standings: this._buildStandings(),         // live mini-leaderboard (sorted by score)
+          respawning: !player.alive,                 // true during the brief wipeout beat
           // Remaining match time -> HUD mm:ss clock (+ final-10s red pulse).
           timeLeft: Math.max(0, TIME_LIMIT - this.clock),
           miniTurboTier: player.state.miniTurboTier,
@@ -1363,6 +1463,30 @@ export class Battle {
         });
       }
     }
+  }
+
+  /**
+   * Live standings for the HUD leaderboard: every kart sorted best-first by SCORE
+   * (then balloons held), each with the fields the panel renders. Small (<= fieldSize)
+   * and the HUD only rewrites the DOM when the data actually changes, so building this
+   * each frame is cheap.
+   * @returns {Array<{id:string,name:string,color:number,isPlayer:boolean,
+   *                  score:number,balloons:number,down:boolean}>}
+   * @private
+   */
+  _buildStandings() {
+    return this.karts
+      .slice()
+      .sort((a, b) => (b.score - a.score) || (b.balloons - a.balloons))
+      .map((rec) => ({
+        id: rec.id,
+        name: this._displayName(rec),
+        color: rec.color,
+        isPlayer: rec.isPlayer,
+        score: rec.score,
+        balloons: Math.max(0, rec.balloons),
+        down: !rec.alive,
+      }));
   }
 
   /**
@@ -1385,16 +1509,18 @@ export class Battle {
   }
 
   /**
-   * The kart the camera should follow: the player if alive, otherwise the first
-   * alive kart (so a knocked-out player still watches the action).
+   * The kart the camera should follow: ALWAYS the player (it stays positioned at its
+   * respawn point during the brief down beat, so the camera tracks it the whole match
+   * with no survivor hand-off). Falls back to the first alive kart only if there's
+   * somehow no player record.
    * @returns {object|null}
    * @private
    */
   _cameraTarget() {
     const player = this._kartById.get('player');
-    if (player && player.alive) return player;
+    if (player) return player;
     const alive = this._aliveKarts();
-    return alive.length > 0 ? alive[0] : player || null;
+    return alive.length > 0 ? alive[0] : null;
   }
 
   // ========================================================================
