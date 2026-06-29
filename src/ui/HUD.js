@@ -1654,23 +1654,37 @@ export class HUD {
     if (sig === this._standingsSig) return;
     this._standingsSig = sig;
 
+    // With a big battle field (up to 12 karts) the full list would overflow the screen, so
+    // we show the TOP rows plus — if they've slipped below the cut — the player's own row
+    // (tagged with its true rank) so you can always see where you stand.
+    const CAP = 8;
+    const rows = [];
+    for (let i = 0; i < standings.length && rows.length < CAP; i++) rows.push({ s: standings[i], rank: i + 1 });
+    if (!rows.some((r) => r.s.isPlayer)) {
+      const pIdx = standings.findIndex((s) => s.isPlayer);
+      if (pIdx >= 0) rows.push({ s: standings[pIdx], rank: pIdx + 1 });
+    }
+
     let html =
       '<div class="text-[10px] font-bold tracking-[0.2em] text-white/55 px-1">STANDINGS</div>';
-    for (let i = 0; i < standings.length; i++) {
-      const s = standings[i];
+    for (let r = 0; r < rows.length; r++) {
+      const s = rows[r].s;
+      const rank = rows[r].rank;
       const rowCls = s.isPlayer
         ? 'bg-cyan-500/25 ring-1 ring-cyan-300/70 text-cyan-100'
         : 'bg-slate-800/40 ring-1 ring-white/10 text-slate-100';
+      // `down` now means MID-RESPAWN (everyone respawns in the score race) — a brief dim +
+      // "···" cue, not a permanent "OUT".
       const dim = s.down ? ' opacity-50' : '';
       const chip =
         '<span class="inline-block w-2.5 h-2.5 rounded-full ring-1 ring-white/40 shrink-0" ' +
         'style="background:' + this._battleColorCss(s.color) + '"></span>';
       const tally = s.down
-        ? '<span class="text-[10px] font-black text-rose-400 tracking-wide">OUT</span>'
+        ? '<span class="text-[10px] font-black text-rose-300/80 tracking-wide">···</span>'
         : '<span class="text-[10px] opacity-70 tabular-nums">🎈' + s.balloons + '</span>';
       html +=
         '<div class="flex items-center gap-1.5 px-1.5 py-0.5 rounded-md text-xs ' + rowCls + dim + '">' +
-        '<span class="w-3 text-center font-black tabular-nums opacity-60">' + (i + 1) + '</span>' +
+        '<span class="w-3 text-center font-black tabular-nums opacity-60">' + rank + '</span>' +
         chip +
         '<span class="flex-1 truncate font-semibold">' + this._escapeName(s.name) + '</span>' +
         '<span class="font-black tabular-nums text-amber-300">★' + s.score + '</span>' +
