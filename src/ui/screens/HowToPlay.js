@@ -189,7 +189,7 @@ export class HowToPlay {
     panel.appendChild(this._gamepadLine);
 
     const mobileLine = document.createElement('p');
-    mobileLine.textContent = 'Mobile — on-screen stick + buttons (no look-back, no pause button).';
+    mobileLine.textContent = 'Mobile — on-screen stick + buttons, plus a ⏸ pause button top-right (no look-back).';
     mobileLine.className = 'text-[11px] leading-snug text-slate-400';
     panel.appendChild(mobileLine);
 

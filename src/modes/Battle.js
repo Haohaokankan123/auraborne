@@ -920,8 +920,13 @@ export class Battle {
     for (let i = 0; i < alive.length; i++) {
       const rec = alive[i];
       const s = rec.state;
-      // Rising edge: it was effectively not spinning before, and is now.
-      const justHit = rec.prevSpin <= SPIN_EDGE_EPS && s.spinTimer > SPIN_EDGE_EPS;
+      // A hit this tick, even mid-recovery. spinTimer only ever DECAYS on its own
+      // (per-tick dt countdown), so any tick where it ROSE means an external hit
+      // fired — whether from a clean 0 (first pop) or on top of a decaying stumble
+      // (a re-hit inside the ~0.45s recovery window). Catching the re-hit case is
+      // what stops pops being silently dropped and mis-credited to a stale attacker.
+      const justHit = s.spinTimer > SPIN_EDGE_EPS &&
+        (rec.prevSpin <= SPIN_EDGE_EPS || s.spinTimer > rec.prevSpin + 1e-6);
       if (!justHit) continue;
       // A starred kart shouldn't have been spun at all, but guard anyway. A fresh
       // spawn shield likewise absorbs the hit — clear the spin, no pop.
@@ -1831,10 +1836,11 @@ export class Battle {
    * dispose contract the mode router (main.js) calls on teardown.
    */
   dispose() {
-    // Remove every kart visual.
+    // Free every kart's materials and detach it (dispose() removes the group too).
     for (let i = 0; i < this.karts.length; i++) {
-      const g = this.karts[i].kart.group;
-      if (g && g.parent) g.parent.remove(g);
+      const kart = this.karts[i].kart;
+      if (kart && typeof kart.dispose === 'function') kart.dispose();
+      else if (kart && kart.group && kart.group.parent) kart.group.parent.remove(kart.group);
     }
     this.karts = [];
     this._kartById.clear();
@@ -1866,17 +1872,15 @@ export class Battle {
       this._prevSceneFog = undefined;
     }
 
-    // Remove the super-horn shockwave ring.
-    if (this._shockwave && this._shockwave.mesh && this._shockwave.mesh.parent) {
-      this._shockwave.mesh.parent.remove(this._shockwave.mesh);
+    // Free the projectile + item-box GPU resources, then detach their groups
+    // (dispose() removes the group too; the guarded remove is a fallback).
+    if (this.projectiles) {
+      if (typeof this.projectiles.dispose === 'function') this.projectiles.dispose();
+      else if (this.projectiles.group && this.projectiles.group.parent) this.projectiles.group.parent.remove(this.projectiles.group);
     }
-
-    // Remove the projectile + item-box groups from the scene.
-    if (this.projectiles && this.projectiles.group && this.projectiles.group.parent) {
-      this.projectiles.group.parent.remove(this.projectiles.group);
-    }
-    if (this.itemBoxes && this.itemBoxes.group && this.itemBoxes.group.parent) {
-      this.itemBoxes.group.parent.remove(this.itemBoxes.group);
+    if (this.itemBoxes) {
+      if (typeof this.itemBoxes.dispose === 'function') this.itemBoxes.dispose();
+      else if (this.itemBoxes.group && this.itemBoxes.group.parent) this.itemBoxes.group.parent.remove(this.itemBoxes.group);
     }
     // (The end-of-battle results board is the shared ResultsScreen owned by the
     // mode router; main.js hides it on teardown / return to menu.)

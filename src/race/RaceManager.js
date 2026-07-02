@@ -1880,10 +1880,10 @@ export class RaceManager {
    * field on return-to-menu. Mirrors Battle.dispose() / MultiplayerRace.dispose().
    */
   dispose() {
-    // Remove every kart visual from its parent (the scene).
+    // Free every kart's materials and detach it (dispose() removes the group too).
     for (const racer of this.racers) {
-      const g = racer.kart && racer.kart.group;
-      if (g && g.parent) g.parent.remove(g);
+      if (racer.kart && typeof racer.kart.dispose === 'function') racer.kart.dispose();
+      else if (racer.kart && racer.kart.group && racer.kart.group.parent) racer.kart.group.parent.remove(racer.kart.group);
     }
 
     // Remove the item-box group, then free its GPU resources if it can.

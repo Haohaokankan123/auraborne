@@ -23,9 +23,18 @@ export class CouchInputHub {
     this._latest = new Map();
     this._off = socketClient.onEvent('couchInput', (payload) => {
       if (!payload || payload.playerId == null) return;
+      const input = payload.input || {};
+      // LATCH an item TAP. The phone sends useItem:true for a single ~30Hz packet
+      // then clears it; if socket.io batches that packet with the following
+      // useItem:false one before the TV's 60Hz sim polls getState(), the rising
+      // edge is lost and the item never fires. Sticky-OR the tap onto the entry and
+      // consume it exactly once in getState() so a press can't be coalesced away.
+      const prev = this._latest.get(payload.playerId);
+      const pendingItem = (prev && prev.pendingItem) || !!input.useItem;
       this._latest.set(payload.playerId, {
-        input: payload.input || {},
+        input,
         tMs: performance.now(),
+        pendingItem,
       });
     });
   }
@@ -44,12 +53,19 @@ export class CouchInputHub {
         const entry = latest.get(playerId);
         const raw = entry ? entry.input : null;
         const stale = !entry || performance.now() - entry.tMs > STALE_MS;
+        // Fire the latched item tap once (never while stale — a quiet phone
+        // shouldn't autofire), then clear it so the next poll doesn't re-fire.
+        let useItem = false;
+        if (entry && !stale && entry.pendingItem) {
+          useItem = true;
+          entry.pendingItem = false;
+        }
         return {
           steer: clamp(num(raw && raw.steer), -1, 1),
           throttle: stale ? 0 : clamp(num(raw && raw.throttle), 0, 1),
           brake: clamp(num(raw && raw.brake), 0, 1),
           drift: !!(raw && raw.drift),
-          useItem: !!(raw && raw.useItem),
+          useItem,
           lookBack: !!(raw && raw.lookBack),
           overdrive: !!(raw && raw.overdrive),
         };

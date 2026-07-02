@@ -207,6 +207,7 @@ let lobby = null;
 let couchLobby = null; // COUCH/TV: the TV's QR-join lobby (separate from `lobby`).
 let _offCouchStart = null; // COUCH/TV: unsubscribe for the persistent raceStart handler.
 let _offCouchLeft = null;  // COUCH/TV: unsubscribe for the playerLeft (AI takeover) handler.
+let _offCouchReconnect = null; // COUCH/TV: unsubscribe for the socket-reconnect re-announce.
 // COUCH/TV: every mode offers a TV variant now (PlayTargetSelect). While the TV
 // path is being configured/run:
 //   tvSetup  — true from "PLAY ON TV" until returnToMenu, so the shared select
@@ -221,6 +222,9 @@ let couchOverlay = null;
 let _couchStateAccum = 0; // ~10Hz 'couchState' emitter (phones' item slots / vibration)
 // HOW-TO gate: true while the pre-race how-to overlay is up (see gateHowTo).
 let _howToPending = false;
+// Modes whose how-to has been auto-shown this session — so cup races 2/3, RACE
+// AGAIN, and restarts don't re-pop the full modal (the menu button still shows it).
+const _howToShownThisSession = new Set();
 
 // M6 audio/VFX bookkeeping: per-frame edge detection state for one-shot SFX +
 // effects. Reset each time a race starts (see resetFxState). We watch the
@@ -550,6 +554,11 @@ function gateHowTo(modeKey, boot) {
     paused = false;           // release the hold; the fresh race is about to build
     return false;             // proceed
   }
+  // Teach each mode only ONCE per session: cup races 2/3, RACE AGAIN, and restarts
+  // must not re-interrupt with the full modal (the menu's HOW TO PLAY button still
+  // opens it on demand). A fresh page load re-teaches once per mode.
+  if (_howToShownThisSession.has(modeKey)) return false; // straight to boot
+  _howToShownThisSession.add(modeKey);
   _howToPending = true;
   if (modeKey !== 'mp') paused = true; // hold any current sim still (MP must never freeze)
   howToPlay.show(modeKey, boot);
@@ -784,6 +793,14 @@ function startTvLobby() {
   // cup races 2/3, and RACE AGAIN rematches all arrive through it.
   if (!_offCouchStart && typeof socket.onEvent === 'function') {
     _offCouchStart = socket.onEvent('raceStart', (payload) => beginTvRace(payload));
+  }
+  // If the TV socket drops and auto-reconnects (new socket.id), re-announce this
+  // screen with its roomId so the server re-seats us on the SAME couch room —
+  // without this the phone→TV relay goes permanently dead after any TV Wi-Fi blip.
+  if (!_offCouchReconnect && typeof socket.onReconnect === 'function') {
+    _offCouchReconnect = socket.onReconnect(() => {
+      if (typeof socket.emit === 'function') socket.emit('joinScreen', { roomId: socket.roomId });
+    });
   }
   // A phone dropped mid-race: its kart gets a local AI brain and the TV toasts it.
   if (!_offCouchLeft && typeof socket.onEvent === 'function') {
@@ -1083,6 +1100,7 @@ function returnToMenu() {
   if (couchHub) { couchHub.dispose(); couchHub = null; }
   if (_offCouchStart) { _offCouchStart(); _offCouchStart = null; }
   if (_offCouchLeft) { _offCouchLeft(); _offCouchLeft = null; }
+  if (_offCouchReconnect) { _offCouchReconnect(); _offCouchReconnect = null; }
   tvSetup = false;
   tvConfig = null;
   if (typeof renderer.setCouchMode === 'function') renderer.setCouchMode(false);
@@ -1140,6 +1158,27 @@ function restartCurrentMode() {
   else if (mode === 'couch') couchPlayAgain(); // fresh 'start' → server rebroadcasts raceStart
 }
 
+// Toggle the pause-or-settings overlay for a LIVE race. Shared by the keyboard
+// (Esc/P) and the on-screen touch ⏸ button so both behave identically. Returns
+// true if it handled the input (opened/closed an overlay), false otherwise.
+function toggleRacePause() {
+  if (howToPlay && howToPlay._active) return true; // How-To owns input; swallow.
+  // An open overlay closes first (works in every context, including the menu ⚙).
+  if (_overlayOpen) { closeOverlay(); return true; }
+  // A LIVE single-player race -> freezing pause. raceOver/finished guard so a tap
+  // over the results board doesn't pop a pause menu. COUCH/TV runs the same LOCAL
+  // sim, so it pauses the same way (phones just stall until resume).
+  const inSoloRace = (mode === 'gp' || mode === 'tt' || mode === 'battle' || mode === 'couch')
+    && manager && !manager.raceOver && !manager.finished;
+  // A LIVE multiplayer race (manager exists = past the lobby) -> non-freezing panel.
+  const inMpRace = mode === 'mp' && manager;
+  if (inSoloRace || inMpRace) {
+    openOverlay(mode === 'mp' ? 'mp' : 'pause');
+    return true;
+  }
+  return false;
+}
+
 // Esc / P: toggle the pause-or-settings overlay during a race; otherwise Esc
 // backs out of pre-race screens to the menu (the original behaviour).
 window.addEventListener('keydown', (e) => {
@@ -1147,20 +1186,7 @@ window.addEventListener('keydown', (e) => {
   if (howToPlay && howToPlay._active) return; // How-To-Play owns input; don't mutate pause/_overlayOpen behind it
   if (e.repeat) return; // ignore auto-repeat while held, else it double-toggles the pause overlay
 
-  // An open overlay closes first (works in every context, including the menu ⚙).
-  if (_overlayOpen) { closeOverlay(); return; }
-
-  // A LIVE single-player race -> freezing pause. raceOver/finished guard so Esc
-  // over the results board doesn't pop a pause menu. COUCH/TV runs the same
-  // LOCAL sim, so it pauses the same way (phones just stall until resume).
-  const inSoloRace = (mode === 'gp' || mode === 'tt' || mode === 'battle' || mode === 'couch')
-    && manager && !manager.raceOver && !manager.finished;
-  // A LIVE multiplayer race (manager exists = past the lobby) -> non-freezing panel.
-  const inMpRace = mode === 'mp' && manager;
-  if (inSoloRace || inMpRace) {
-    openOverlay(mode === 'mp' ? 'mp' : 'pause');
-    return;
-  }
+  if (toggleRacePause()) return;
   // TV lobby (QR screen up, no race yet): Esc backs out to the menu below.
 
   // Pre-race screens (select/track/difficulty/lobby): Esc returns to the menu.
@@ -1168,6 +1194,9 @@ window.addEventListener('keydown', (e) => {
     returnToMenu();
   }
 });
+
+// On-screen touch ⏸ (phones have no keyboard): same pause path as Esc/P.
+window.addEventListener('touchpause', () => { toggleRacePause(); });
 
 // ----------------------------------------------------------------------------
 // 10. AUDIO + VFX glue (central hooks; the smallest number of spots).

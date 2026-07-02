@@ -64,6 +64,14 @@ export class SocketClient {
     // which kart in a snapshot is "us".
     this.playerId = null;
     this.roomId = null;
+
+    // --- Reconnect notifications ----------------------------------------
+    // socket.io transparently reconnects after a network blip with a NEW socket.id.
+    // The server forgets the old id, so a couch/TV client must re-announce itself
+    // (re-emit 'joinScreen' with its roomId) or the whole relay goes silently dead.
+    // We fire these on every reconnect AFTER the first successful connect.
+    this._reconnectListeners = new Set();
+    this._hasConnected = false;
   }
 
   // -----------------------------------------------------------------------
@@ -84,6 +92,17 @@ export class SocketClient {
       // Prefer websocket but allow the polling fallback so a strict proxy still
       // works. socket.io upgrades to ws automatically when it can.
       transports: ['websocket', 'polling'],
+    });
+
+    // Fire reconnect listeners on every RE-connect (not the first connect), so a
+    // couch/TV client can re-announce its screen and revive the relay.
+    this.socket.on('connect', () => {
+      if (this._hasConnected) {
+        for (const cb of this._reconnectListeners) {
+          try { cb(); } catch (err) { console.error('SocketClient reconnect listener threw:', err); }
+        }
+      }
+      this._hasConnected = true;
     });
 
     // Cache playerId/roomId off the 'joined' reply so callers can read them
@@ -116,6 +135,24 @@ export class SocketClient {
     // reused instance and fire stale callbacks into the next session.
     for (const set of this._listeners.values()) set.clear();
     this._lastPayload.clear();
+    this._reconnectListeners.clear();
+    this._hasConnected = false;
+    // Drop the reconciliation buffer too: a reconnect on the same instance must not
+    // replay dead inputs from the previous session into the Predictor.
+    this._inputHistory.clear();
+    this._seq = 0;
+  }
+
+  /**
+   * Subscribe to socket reconnects (fired after a transport drop + auto-reconnect,
+   * NOT on the first connect). The callback should re-announce this client to the
+   * server. Returns an unsubscribe function.
+   * @param {() => void} callback
+   * @returns {() => void}
+   */
+  onReconnect(callback) {
+    this._reconnectListeners.add(callback);
+    return () => this._reconnectListeners.delete(callback);
   }
 
   /** @returns {boolean} true while the underlying socket is connected. */

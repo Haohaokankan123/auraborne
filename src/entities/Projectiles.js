@@ -1422,4 +1422,57 @@ export class ProjectileSystem {
       fx.material.opacity = lifeFraction * fx.startOpacity;
     }
   }
+
+  /**
+   * Free every geometry/material/texture this system built and detach its group. A
+   * fresh ProjectileSystem is constructed each race, so its ~40 asset singletons,
+   * 160-plane trail pool, per-projectile glow materials and orbit-pool meshes are
+   * all owned here and were previously orphaned in GPU memory on every race/battle
+   * restart (RaceManager.dispose already guards `typeof projectiles.dispose ===
+   * 'function'` — this makes that call do real work).
+   *
+   * Everything the pool ever instantiated stays parented to `this.group` (projectiles
+   * and their glows are pooled, never removed), so one traverse frees the bulk. We
+   * then dispose the two shared FX geometries directly and build each asset factory
+   * once so the eager, closure-captured singletons of any type that never SPAWNED
+   * this race also become reachable and get freed. A Set dedups all overlap.
+   */
+  dispose() {
+    const seenG = new Set();
+    const seenM = new Set();
+    const disposeMat = (m) => {
+      if (!m || seenM.has(m)) return;
+      seenM.add(m);
+      for (const k of ['map', 'emissiveMap', 'alphaMap']) {
+        const tex = m[k];
+        if (tex && typeof tex.dispose === 'function') tex.dispose();
+      }
+      if (typeof m.dispose === 'function') m.dispose();
+    };
+    const disposeGeo = (g) => {
+      if (g && !seenG.has(g) && typeof g.dispose === 'function') { seenG.add(g); g.dispose(); }
+    };
+    const walk = (root) => {
+      if (!root || typeof root.traverse !== 'function') return;
+      root.traverse((o) => {
+        disposeGeo(o.geometry);
+        const mat = o.material;
+        if (Array.isArray(mat)) mat.forEach(disposeMat);
+        else disposeMat(mat);
+      });
+    };
+    // Active + pooled projectiles, their glows, the 160 trail planes, orbit meshes.
+    walk(this.group);
+    // The two shared FX geometries (trailGeo is reached above via the trail meshes;
+    // glowGeo only if a projectile ever spawned — dispose both directly to be sure).
+    if (this._fx) { disposeGeo(this._fx.glowGeo); disposeGeo(this._fx.trailGeo); }
+    // Eager singletons of types that never spawned: build each factory once so its
+    // captured geo/mat become reachable, then free them (already-seen ones are skipped).
+    if (this._assets) {
+      for (const key of Object.keys(this._assets)) {
+        try { walk(this._assets[key].build()); } catch (_) { /* dormant/edge factory */ }
+      }
+    }
+    if (this.group.parent) this.group.parent.remove(this.group);
+  }
 }

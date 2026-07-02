@@ -164,6 +164,11 @@ export class GameServer {
    */
   _findOpenRoom() {
     for (const room of this.rooms.values()) {
+      // Skip couch rooms: they're joined ONLY via their explicit QR roomId, and sit
+      // with started=false between cup races / while awaiting RACE AGAIN. Without
+      // this guard a stranger clicking "Play Online" gets silently seated into a
+      // family's living-room game (it's often the only open room on a small server).
+      if (room.couch) continue;
       if (!room.started && room.humanCount() < MAX_HUMANS_PER_ROOM) {
         return room;
       }
@@ -198,9 +203,29 @@ export class GameServer {
    * @param {import('socket.io').Socket} socket
    * @private
    */
-  _onJoinScreen(socket) {
+  _onJoinScreen(socket, payload) {
     // A socket is either a screen or a player, never both.
     if (this.players.has(socket.id) || this.screens.has(socket.id)) return;
+
+    // RECONNECT: the TV lost its socket (Wi-Fi blip / tab reload) and came back
+    // with a NEW socket.id. If it names a couch room it previously owned and that
+    // room is currently screen-less, re-seat THIS socket as that room's screen
+    // instead of minting a new room + QR — the phones never left, so the relay
+    // simply resumes and nobody has to re-scan. (Gated on payload.roomId, which
+    // only a reconnect sends, so the first-time join path below is unchanged.)
+    const wantId = payload && typeof payload.roomId === 'string' ? payload.roomId : null;
+    if (wantId) {
+      const existing = this.rooms.get(wantId);
+      if (existing && existing.couch && !this._roomHasScreen(wantId)) {
+        socket.join(existing.id);
+        this.screens.set(socket.id, existing.id);
+        socket.emit('joined', { playerId: null, roomId: existing.id, lanIp: this._lanIp });
+        // Only refresh the lobby if the race hasn't started — mid-race a stray
+        // 'lobby' could bounce the phones' controller UI back to the waiting state.
+        if (!existing.started) this._broadcastLobby(existing);
+        return;
+      }
+    }
 
     // Always create a FRESH room so the couch session has its own private lobby;
     // phones join it explicitly via the QR's ?room=id.

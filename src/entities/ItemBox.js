@@ -528,4 +528,32 @@ export class ItemBoxManager {
     box.mesh.material = this._material;
     box.core.material = this._coreMaterial;
   }
+
+  /**
+   * Free every geometry/material/texture this manager built (its box/panel/halo/
+   * core/ring assets, the sigil CanvasTexture, and any per-box pop-shell clones)
+   * and detach its group. A fresh ItemBoxManager is constructed each race, so all
+   * of these are owned here and were previously orphaned in GPU memory on every
+   * race restart. Walk the group (dedup via a Set) like Track.dispose().
+   */
+  dispose() {
+    const seen = new Set();
+    const disposeMat = (m) => {
+      if (!m || seen.has(m)) return;
+      seen.add(m);
+      for (const k of ['map', 'emissiveMap', 'alphaMap', 'normalMap']) {
+        const tex = m[k];
+        if (tex && typeof tex.dispose === 'function') tex.dispose();
+      }
+      if (typeof m.dispose === 'function') m.dispose();
+    };
+    this.group.traverse((o) => {
+      if (o.geometry && typeof o.geometry.dispose === 'function') o.geometry.dispose();
+      const mat = o.material;
+      if (Array.isArray(mat)) mat.forEach(disposeMat);
+      else disposeMat(mat);
+    });
+    if (this._sigilTexture && typeof this._sigilTexture.dispose === 'function') this._sigilTexture.dispose();
+    if (this.group.parent) this.group.parent.remove(this.group);
+  }
 }

@@ -21,6 +21,8 @@
 // Plain DOM above the canvas, below menus. All writes are change-gated so a
 // 60fps update() causes zero DOM churn while nothing visible changes.
 
+import { getItem } from '../items/items.js';
+
 // Tiny local copy of core/Renderer.js's couchLayout so the panels land inside
 // each player's viewport region without importing the renderer:
 //   1 -> full screen        2 -> stacked halves (MK-style, full width each)
@@ -191,14 +193,14 @@ export class CouchOverlay {
     return c;
   }
 
-  // Held-item id -> icon. Falls back to a gift box.
+  // Held-item id -> icon. Reuses the CANONICAL icon from items.js so the TV panel
+  // always matches the solo HUD (they diverged before — e.g. red shell showed 🎯
+  // here but 🔴 in single-player). Empty for no item; gift-box fallback for any
+  // unknown id.
   _itemIcon(id) {
-    const M = {
-      banana: '🍌', tripleBanana: '🍌', greenShell: '🐢', tripleGreen: '🐢', redShell: '🎯', tripleRed: '🎯',
-      blueShell: '🌀', bobOmb: '💣', fakeBox: '🎁', mushroom: '🍄', tripleMushroom: '🍄', goldMushroom: '🍄',
-      goldenMushroom: '🍄', star: '⭐', lightning: '⚡', bulletBill: '🚀', boo: '👻', coin: '🪙',
-    };
-    return id ? (M[id] || '🎁') : '';
+    if (!id) return '';
+    const def = getItem(id);
+    return def && def.icon ? def.icon : '🎁';
   }
 
   // ------------------------------------------------------------------------

@@ -264,7 +264,7 @@ export const ITEMS = {
     name: 'Fake Item Box',
     kind: 'trap',
     color: 0x99662e,
-    icon: '❓', // question-mark emoji — the decoy item box
+    icon: '🎁', // gift box — the decoy item box (distinct from the ❓ mystery box)
     description: 'A decoy item box that spins out whoever touches it.',
     forward: false,
     spinSecs: 1.5, // a fake-box grab is a solid spin, like a banana
