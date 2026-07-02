@@ -12,6 +12,10 @@ npm-debug.log*
 .DS_Store
 *.swp
 
+# Local HTTPS certificates (mkcert) for couch mode — never commit these
+server/certs/
+*.pem
+
 # Tooling / local-only artifacts
 .playwright-mcp/
 graphify-out/
@@ -21,3 +25,4 @@ graphify-out/
 *.jpeg
 *.jpg
 *.png
+.lavish/

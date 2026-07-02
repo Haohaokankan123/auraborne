@@ -162,6 +162,7 @@ export class Track {
     this._starMaterials = [];    // Points materials we gently twinkle
     this._starLayers = [];       // parallax star layers { obj, drift } we rotate
     this._spinProps = [];        // spinning decor (sky windmills) { obj, speed }
+    this._portals = [];          // dimension-portal vortices { disc, ring, spin } animated in update(dt)
     // Road CANVAS textures we scroll along V (length) every frame for a SENSE OF
     // SPEED. Each entry is { tex, speed } — `speed` is V-units/sec. The rainbow
     // spectrum runs ALONG V, so scrolling it ALSO makes the spectrum flow + hue
@@ -184,6 +185,7 @@ export class Track {
     this._buildEdgeLines();     // neutral kerb + shoulder apron — VISUAL ONLY (no colliders)
     this._buildRailReflections(); // HIGH+ ONLY: wet additive rail/center glow streaks on the deck
     this._buildAntigravRails(); // bright neon tube rails along any anti-grav corkscrew
+    this._buildPortals();       // glowing DIMENSION-PORTAL gates at each corkscrew entry/exit
     this._buildFeatures();      // ramps / boost pads / hazards / shortcuts
     this._buildCheckpoints();   // centerline gates + start/finish visuals
     this._buildLandmarks();     // themed set-pieces / roadside props / banner / decor
@@ -1008,6 +1010,156 @@ export class Track {
         this.group.add(strip);
       }
     }
+  }
+
+  // =========================================================================
+  // DIMENSION PORTALS (VISUAL ONLY — no collider, no physics)
+  // =========================================================================
+
+  /**
+   * Build a glowing PORTAL GATE at the entry AND exit of every anti-grav section.
+   * The kart drives THROUGH the entry portal into the spinning corkscrew — "another
+   * dimension" — and back out the exit portal. Each gate is a fat emissive TORUS
+   * hoop encircling the road plus a swirling additive VORTEX disc filling it, both
+   * oriented so their axis points down the driving tangent (roll ~ 0 at a section
+   * boundary, so the hoop stands upright across the road). PURELY decorative: it
+   * reads the SAME surfaceFrameAt the corkscrew rail uses, adds zero colliders, and
+   * the swirl is animated by a free transform in update(dt) — the deterministic sim
+   * never sees it. Themed per track (space = violet wormhole, rainbow = spectral,
+   * sky = golden gate). @private
+   */
+  _buildPortals() {
+    const sections = this.data.antigrav;
+    if (!sections || !sections.length) return;
+
+    // The hoop spans the full road plus a margin so the kart clearly passes inside it.
+    const R = this.roadWidth * 0.78;          // hoop center radius
+    const tube = Math.max(1.1, this.roadWidth * 0.085); // hoop thickness
+    const lift = R * 0.62;                     // raise the hoop center so the ring arches OVER the road
+
+    // Per-theme portal palette: a hot RIM color (the solid hoop) and a VORTEX color
+    // (the swirling disc inside). Tuned to feel like a tear in space for each world.
+    let rimCol, vortexCol;
+    if (this.themeId === 'space') {
+      rimCol = 0xb24dff; vortexCol = 0x00e5ff;     // violet rim, cyan wormhole
+    } else if (this.themeId === 'rainbow') {
+      rimCol = 0xff4fd8; vortexCol = 0xffe24d;     // magenta rim, gold spectral core
+    } else {
+      rimCol = 0xffd34d; vortexCol = 0xffffff;     // sky: gold rim, white-hot core
+    }
+
+    // Shared swirling vortex texture: concentric spiral arms on a dark core, drawn
+    // once and spun via the disc's rotation in update(dt). Additive + toneMapped:false
+    // so it blooms like a real portal.
+    const vortexTex = this._makeVortexTexture(vortexCol);
+
+    const ringGeo = new THREE.TorusGeometry(R, tube, 14, 48);
+    const rimMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(rimCol),
+      emissive: new THREE.Color(rimCol),
+      emissiveIntensity: 1.6,   // hot enough to bloom into a bright gate
+      roughness: 0.35,
+      metalness: 0.3,
+    });
+    const discGeo = new THREE.CircleGeometry(R - tube * 0.4, 48);
+
+    // Place an entry gate at startU and an exit gate at endU of each section.
+    for (const sec of sections) {
+      for (const u of [sec.startU, sec.endU]) {
+        const fr = surfaceFrameAt(this.trackId, u, 0);
+        // Hoop center: road center, raised along the surface up by `lift` so the
+        // ring arches over the deck (the road passes through the lower half).
+        const cx = fr.worldPos.x + fr.up.x * lift;
+        const cy = fr.worldPos.y + fr.up.y * lift;
+        const cz = fr.worldPos.z + fr.up.z * lift;
+
+        // Orient: a Torus/Circle lies in its local XY plane with axis +Z. Aim that
+        // axis down the driving tangent so the gate faces oncoming karts.
+        const quat = new THREE.Quaternion().setFromUnitVectors(
+          new THREE.Vector3(0, 0, 1),
+          new THREE.Vector3(fr.tangent.x, fr.tangent.y, fr.tangent.z).normalize(),
+        );
+
+        const ring = new THREE.Mesh(ringGeo, rimMat);
+        ring.position.set(cx, cy, cz);
+        ring.quaternion.copy(quat);
+        ring.name = 'portalRing';
+        ring.frustumCulled = false;
+        this.group.add(ring);
+
+        // The swirling vortex disc, recessed a hair behind the hoop plane so the rim
+        // reads as a frame around it. Additive, unlit, spins in update(dt).
+        const discMat = new THREE.MeshBasicMaterial({
+          map: vortexTex,
+          transparent: true,
+          opacity: 0.85,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+          toneMapped: false,
+        });
+        const disc = new THREE.Mesh(discGeo, discMat);
+        disc.position.set(cx, cy, cz);
+        disc.quaternion.copy(quat);
+        disc.name = 'portalVortex';
+        disc.frustumCulled = false;
+        this.group.add(disc);
+
+        // Spin each vortex about its own axis; alternate direction per gate so the
+        // entry and exit swirl opposite ways (a nice "in one side, out the other").
+        const spin = (u === sec.startU ? 1.8 : -1.6);
+        this._portals.push({ disc, ring, spin, baseEmissive: 1.6 });
+      }
+    }
+  }
+
+  /**
+   * Draw a swirling-vortex CanvasTexture: a bright spiral on a transparent field that
+   * fades to nothing at the rim, tinted by `color` (hex int). Built once per track and
+   * spun via the disc transform — no per-frame repaint. @private
+   * @param {number} color  hex int tint for the spiral.
+   * @returns {THREE.CanvasTexture}
+   */
+  _makeVortexTexture(color) {
+    const S = 256;
+    const canvas = document.createElement('canvas');
+    canvas.width = S; canvas.height = S;
+    const ctx = canvas.getContext('2d');
+    const c = new THREE.Color(color);
+    const r255 = Math.round(c.r * 255), g255 = Math.round(c.g * 255), b255 = Math.round(c.b * 255);
+    // Dark base so additive blending shows the spiral arms, not a flat wash.
+    ctx.fillStyle = 'rgba(4,2,16,1)';
+    ctx.fillRect(0, 0, S, S);
+    const cx = S / 2, cy = S / 2;
+    // Several spiral arms swept out from the core.
+    const arms = 5;
+    for (let a = 0; a < arms; a++) {
+      ctx.beginPath();
+      const phase = (a / arms) * Math.PI * 2;
+      for (let t = 0; t <= 1; t += 0.01) {
+        const ang = phase + t * Math.PI * 4;     // 2 full turns per arm
+        const rad = t * (S * 0.46);
+        const x = cx + Math.cos(ang) * rad;
+        const y = cy + Math.sin(ang) * rad;
+        if (t === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = `rgba(${r255},${g255},${b255},0.9)`;
+      ctx.stroke();
+    }
+    // A hot white-ish core glow.
+    const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, S * 0.5);
+    grad.addColorStop(0, `rgba(${Math.min(255, r255 + 80)},${Math.min(255, g255 + 80)},${Math.min(255, b255 + 80)},0.95)`);
+    grad.addColorStop(0.25, `rgba(${r255},${g255},${b255},0.35)`);
+    grad.addColorStop(1, 'rgba(0,0,0,0)'); // fade to nothing at the rim
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(cx, cy, S * 0.5, 0, Math.PI * 2);
+    ctx.fill();
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.name = 'portalVortexTex';
+    return tex;
   }
 
   // =========================================================================
@@ -2570,6 +2722,18 @@ export class Track {
     if (this._spinProps.length) {
       for (const prop of this._spinProps) {
         prop.obj.rotation.z += prop.speed * (dt || 0);
+      }
+    }
+
+    // DIMENSION PORTALS: spin each vortex disc about its own axis (the tangent) so
+    // the swirl churns, and pulse the gate rim's glow so the portal "breathes". Free
+    // transforms / a single emissive write — no geometry touched. Empty on tracks
+    // without anti-grav sections, so this is a no-op there.
+    if (this._portals.length) {
+      const pulse = 1.3 + 0.5 * Math.sin(t * 3.0); // rim glow breathing
+      for (const p of this._portals) {
+        p.disc.rotateZ(p.spin * (dt || 0));        // churn the swirl in its plane
+        p.ring.material.emissiveIntensity = p.baseEmissive * pulse;
       }
     }
   }

@@ -92,9 +92,13 @@ import { ResultsScreen } from './ui/ResultsScreen.js'; // R11 end-of-race result
 import { CoinShop } from './ui/screens/CoinShop.js'; // Coin shop: spend race coins on cosmetics.
 import { DifficultySelect } from './ui/screens/DifficultySelect.js'; // R12 difficulty picker.
 import { Lobby } from './ui/screens/Lobby.js';
+import { CouchLobby } from './ui/screens/CouchLobby.js'; // COUCH/TV: QR-join lobby on the TV.
+import { PlayTargetSelect } from './ui/screens/PlayTargetSelect.js'; // HERE / ON TV picker (every mode).
+import { CouchOverlay } from './ui/CouchOverlay.js'; // COUCH/TV: split-screen panels + results on the TV.
 
 // Multiplayer networking (M4).
 import { SocketClient } from './net/SocketClient.js';
+import { CouchInputHub } from './net/CouchInputHub.js'; // COUCH/TV: phone inputs relayed via the server.
 
 // ----------------------------------------------------------------------------
 // 1. Build the engine systems shared by every mode.
@@ -200,8 +204,27 @@ let difficulty = 'medium';
 let cup = null;
 let socket = null;
 let lobby = null;
+let couchLobby = null; // COUCH/TV: the TV's QR-join lobby (separate from `lobby`).
+let _offCouchStart = null; // COUCH/TV: unsubscribe for the persistent raceStart handler.
+let _offCouchLeft = null;  // COUCH/TV: unsubscribe for the playerLeft (AI takeover) handler.
+let _offCouchReconnect = null; // COUCH/TV: unsubscribe for the socket-reconnect re-announce.
+// COUCH/TV: every mode offers a TV variant now (PlayTargetSelect). While the TV
+// path is being configured/run:
+//   tvSetup  — true from "PLAY ON TV" until returnToMenu, so the shared select
+//              screens (track/difficulty) route into the QR lobby, not a solo boot.
+//   tvConfig — the chosen game: { mode:'gp'|'tt'|'battle', trackId, difficulty, cup }.
+//   couchHub — CouchInputHub: latest relayed input per phone (providerFor(id)).
+//   couchOverlay — the TV's split-screen panels/countdown/results DOM layer.
+let tvSetup = false;
+let tvConfig = null;
+let couchHub = null;
+let couchOverlay = null;
+let _couchStateAccum = 0; // ~10Hz 'couchState' emitter (phones' item slots / vibration)
 // HOW-TO gate: true while the pre-race how-to overlay is up (see gateHowTo).
 let _howToPending = false;
+// Modes whose how-to has been auto-shown this session — so cup races 2/3, RACE
+// AGAIN, and restarts don't re-pop the full modal (the menu button still shows it).
+const _howToShownThisSession = new Set();
 
 // M6 audio/VFX bookkeeping: per-frame edge detection state for one-shot SFX +
 // effects. Reset each time a race starts (see resetFxState). We watch the
@@ -224,6 +247,32 @@ const menu = new Menu({
   onMultiplayer: () => startMultiplayer(),
   onSettings: () => openOverlay('menu'), // ⚙ opens the volume panel (no race needed)
   onShop: () => openShop(),               // SHOP opens the coin shop (spend race coins)
+});
+
+// PLAY TARGET: the first question after picking any mode — HERE (solo, today's
+// exact flow) or ON TV (QR lobby + phones as controllers, same rules/sim).
+const playTargetSelect = new PlayTargetSelect({
+  onHere: () => {
+    tvSetup = false;
+    playTargetSelect.hide();
+    characterSelect.show();
+    // mode stays 'select' — same state the old flow used for CharacterSelect.
+  },
+  onTV: () => {
+    tvSetup = true;
+    playTargetSelect.hide();
+    if (pendingMode === 'battle') {
+      // Battle has no track/difficulty to pick — straight to the QR lobby.
+      startTvLobby();
+    } else {
+      // GP: track (+ CUP banner) then difficulty; TT: track only. Same screens
+      // as solo — CharacterSelect is skipped (phones pick no character).
+      trackSelect.show({ cup: pendingMode === 'gp' });
+      mode = 'track';
+      syncDebug();
+    }
+  },
+  onBack: () => returnToMenu(),
 });
 
 // PAUSE / SETTINGS overlay. Reused for all three contexts (single-player pause,
@@ -266,7 +315,9 @@ const trackSelect = new TrackSelect({
   onCup: () => startCup(),
   onBack: () => {
     trackSelect.hide();
-    characterSelect.show();
+    // TV flow skipped CharacterSelect, so BACK returns to the HERE/TV picker.
+    if (tvSetup) playTargetSelect.show(pendingMode);
+    else characterSelect.show();
     mode = 'select';
     syncDebug();
   },
@@ -414,7 +465,8 @@ function applyTrackTheme(t) {
 function openSelect(targetMode) {
   pendingMode = targetMode;
   menu.hide();
-  characterSelect.show();
+  // Every mode first asks WHERE to play: HERE (the classic solo flow) or ON TV.
+  playTargetSelect.show(targetMode);
   mode = 'select';
   syncDebug();
 }
@@ -454,7 +506,8 @@ function onTrackConfirmed(id) {
   trackSelect.hide();
 
   if (pendingMode === 'tt') {
-    startTimeTrial();
+    if (tvSetup) startTvLobby();
+    else startTimeTrial();
   } else {
     // GRAND PRIX: pick a difficulty before booting the race.
     difficultySelect.show();
@@ -466,7 +519,9 @@ function onTrackConfirmed(id) {
 // The player clicked the GRAND PRIX CUP banner on the track picker. Arm a fresh
 // championship, then pick a difficulty (same picker as a single GP) before race 1.
 function startCup() {
-  cup = new GrandPrixCup();
+  // TV cups keep the full points/standings machinery but must never write the
+  // Mac owner's playerStats for a phone's finish (coins/trophies/tier unlocks).
+  cup = new GrandPrixCup({ persistRewards: !tvSetup });
   cup.start();
   trackSelect.hide();
   difficultySelect.show();
@@ -480,7 +535,8 @@ function onDifficultyConfirmed(d) {
   difficulty = (d === 'easy' || d === 'hard') ? d : 'medium';
   difficultySelect.hide();
   if (cup) trackId = cup.currentTrack();
-  startGrandPrix();
+  if (tvSetup) startTvLobby();
+  else startGrandPrix();
 }
 
 // ----------------------------------------------------------------------------
@@ -498,6 +554,11 @@ function gateHowTo(modeKey, boot) {
     paused = false;           // release the hold; the fresh race is about to build
     return false;             // proceed
   }
+  // Teach each mode only ONCE per session: cup races 2/3, RACE AGAIN, and restarts
+  // must not re-interrupt with the full modal (the menu's HOW TO PLAY button still
+  // opens it on demand). A fresh page load re-teaches once per mode.
+  if (_howToShownThisSession.has(modeKey)) return false; // straight to boot
+  _howToShownThisSession.add(modeKey);
   _howToPending = true;
   if (modeKey !== 'mp') paused = true; // hold any current sim still (MP must never freeze)
   howToPlay.show(modeKey, boot);
@@ -702,6 +763,304 @@ function beginMultiplayerRace(payload) {
 }
 
 // ----------------------------------------------------------------------------
+// 8b. COUCH/TV — "PLAY ON TV" from any mode. The Mac (plugged into a TV) joins
+// as a seat-less SCREEN for the QR lobby, then runs the SAME local sim the solo
+// mode uses (RaceManager / Battle) with each phone's relayed input driving its
+// own kart — identical rules/physics/AI by construction. The server only relays:
+// phones' 'input' → 'couchInput' here; our 'couchState' → phones' 'snapshot'.
+// ----------------------------------------------------------------------------
+function startTvLobby() {
+  teardownMode();
+  mode = 'couch';
+  tvConfig = {
+    mode: pendingMode || 'gp',
+    trackId: pendingMode === 'battle' ? null : trackId,
+    difficulty,
+    cup: !!cup,
+  };
+
+  if (!socket) socket = new SocketClient('');
+  socket.connect();
+  // Announce ourselves as the TV/screen (takes no kart slot). The server replies
+  // 'joined' with the room id, which the lobby turns into a join QR.
+  if (typeof socket.emit === 'function') socket.emit('joinScreen', {});
+
+  // Phone-input hub: keeps the latest relayed input per phone; the sims read it
+  // through providerFor(playerId) exactly like Input.getState().
+  if (!couchHub) couchHub = new CouchInputHub(socket);
+
+  // ONE persistent raceStart handler for the whole TV session: the first race,
+  // cup races 2/3, and RACE AGAIN rematches all arrive through it.
+  if (!_offCouchStart && typeof socket.onEvent === 'function') {
+    _offCouchStart = socket.onEvent('raceStart', (payload) => beginTvRace(payload));
+  }
+  // If the TV socket drops and auto-reconnects (new socket.id), re-announce this
+  // screen with its roomId so the server re-seats us on the SAME couch room —
+  // without this the phone→TV relay goes permanently dead after any TV Wi-Fi blip.
+  if (!_offCouchReconnect && typeof socket.onReconnect === 'function') {
+    _offCouchReconnect = socket.onReconnect(() => {
+      if (typeof socket.emit === 'function') socket.emit('joinScreen', { roomId: socket.roomId });
+    });
+  }
+  // A phone dropped mid-race: its kart gets a local AI brain and the TV toasts it.
+  if (!_offCouchLeft && typeof socket.onEvent === 'function') {
+    _offCouchLeft = socket.onEvent('playerLeft', (payload) => {
+      if (!payload || payload.playerId == null) return;
+      if (manager && typeof manager.replaceWithAI === 'function') {
+        manager.replaceWithAI(payload.playerId);
+      }
+      if (couchOverlay) {
+        couchOverlay.toast((payload.name || 'A player') + ' left — AI took over');
+      }
+    });
+  }
+
+  if (couchLobby) { couchLobby.dispose(); couchLobby = null; }
+  couchLobby = new CouchLobby({ socketClient: socket, config: tvConfig });
+  couchLobby.show();
+
+  syncDebug();
+}
+
+// Boot the local sim once the server broadcasts 'raceStart' (host pressed START).
+// payload: { mode, trackId, difficulty, cup, players:[{id,name,color}] }.
+function beginTvRace(payload) {
+  if (couchLobby) { couchLobby.dispose(); couchLobby = null; }
+  teardownMode();
+  _resultsShown = false;
+  _battleResultsShown = false;
+
+  const cfg = tvConfig || {};
+  const tvGame = (payload && payload.mode) || cfg.mode || 'gp';
+  const players = (payload && payload.players) || [];
+  const humans = players.map((p) => ({
+    id: p.id,
+    name: p.name,
+    color: p.color,
+    inputProvider: couchHub.providerFor(p.id),
+  }));
+  // "+ KEYBOARD PLAYER": the person at the TV races too, on the real Input.
+  // Remember the choice on tvConfig so RACE AGAIN keeps the keyboard kart.
+  if (payload && payload.kb) cfg.kb = true;
+  if (cfg.kb) {
+    humans.push({
+      id: 'kb',
+      name: 'KEYBOARD',
+      color: 0xff3b30, // the classic player red
+      inputProvider: { getState: () => input.getState() },
+    });
+  }
+  if (!humans.length) return; // nothing to race (shouldn't happen — server gates)
+
+  // Split-screen draws the scene 2-4x, so drop the per-frame cost: shadows off
+  // (also no-ops the "sun follows one kart" thrash across quadrants).
+  if (typeof renderer.setCouchMode === 'function') renderer.setCouchMode(true);
+  // Hide the single-player HUD — each quadrant gets its own CouchOverlay panel.
+  if (hud && hud.element) hud.element.style.display = 'none';
+
+  if (tvGame === 'battle') {
+    // SAME Battle class as solo (identical rules); phones are just harder to
+    // aim with, so the TV passes the reduced AI intensity (20-40 pops target).
+    // No renderer/hud/input: the split-screen rig + CouchOverlay own the TV's
+    // cameras and panels, and every kart is phone- or bot-driven.
+    track = null;
+    manager = new Battle({
+      scene: renderer.scene,
+      audio,
+      vfx,
+      humans,
+      // Couch/TV is gentler AND shorter than solo battle: phones are harder to
+      // aim, so bots ease off (AI_INTENSITY 0.5) and the match is 4 min not 6,
+      // landing each AI's pops in the 20-40 band (measured in tune-battle.mjs).
+      tuning: { AI_INTENSITY: 0.5, TIME_LIMIT: 240 },
+      fieldSize: 8,
+    });
+  } else {
+    const tvTrackId = (payload && payload.trackId) || cfg.trackId || 'circuit';
+    track = new Track(tvTrackId);
+    renderer.scene.add(track.group);
+    applyTrackTheme(track); // dark void skybox + per-theme bloom
+    manager = new RaceManager(renderer.scene, track, input, {
+      humans,
+      difficulty: (payload && payload.difficulty) || cfg.difficulty || difficulty,
+      // TT on TV = the same race sim with no AI/items/contact: N humans racing
+      // the clock on identical physics + laps (solo TimeTrial semantics).
+      ...(tvGame === 'tt' ? { aiCount: 0, noItems: true, noContact: true } : {}),
+    });
+    audio.selectTrackMusic(tvTrackId);
+  }
+
+  if (couchOverlay) { couchOverlay.dispose(); couchOverlay = null; }
+  couchOverlay = new CouchOverlay();
+  couchOverlay.setPlayers(players.map((p) => ({ id: p.id, name: p.name, color: p.color })));
+
+  raceClock = 0;
+  _couchStateAccum = 0;
+  mode = 'couch';
+
+  startRaceAudio(); // countdown beeps + release() at GO — same as a solo race
+  resetFxState();
+  syncDebug();
+}
+
+// TV RACE AGAIN / next cup race: the phones stay connected, so emitting 'start'
+// makes the server rebroadcast 'raceStart' and the persistent handler rebuilds a
+// fresh local sim for the same crew.
+function couchPlayAgain() {
+  if (socket && typeof socket.emit === 'function' && tvConfig) {
+    socket.emit('start', {
+      mode: tvConfig.mode,
+      trackId: tvConfig.trackId,
+      difficulty: tvConfig.difficulty,
+      cup: !!cup,
+      kb: !!tvConfig.kb,
+    });
+  }
+}
+
+// The TV race/battle just ended: notify the phones (finish screen + lobby
+// reopens server-side), then show the right board — cup standings/champion via
+// the shared ResultsScreen, single races/battles via the overlay's board.
+function endTvRace(results) {
+  const rows = Array.isArray(results) ? results : [];
+  if (socket && typeof socket.emit === 'function') {
+    // `pos` (not `place`): the phones' existing raceEnd handler reads me.pos.
+    socket.emit('couchEnd', {
+      results: rows.map((r, i) => ({
+        id: r.id,
+        pos: r.place != null ? r.place : i + 1,
+        name: r.name,
+      })),
+    });
+  }
+  audio.sfxFinish();
+
+  if (cup && tvConfig && tvConfig.mode === 'gp') {
+    cup.recordRaceResults(rows);
+    if (!cup.isComplete()) {
+      resultsScreen.showCupStandings(cup, {
+        onNext: () => {
+          resultsScreen.hide();
+          cup.nextRace();
+          trackId = cup.currentTrack();
+          tvConfig.trackId = trackId;
+          couchPlayAgain(); // 'start' → 'raceStart' → beginTvRace on the next track
+        },
+        onMenu: () => { resultsScreen.hide(); returnToMenu(); },
+      });
+    } else {
+      resultsScreen.showCupChampion(cup, {
+        onRestartCup: () => {
+          resultsScreen.hide();
+          cup.start();
+          trackId = cup.currentTrack();
+          tvConfig.trackId = trackId;
+          couchPlayAgain();
+        },
+        onMenu: () => { resultsScreen.hide(); returnToMenu(); },
+      });
+    }
+    return;
+  }
+
+  if (couchOverlay) {
+    couchOverlay.showResults(
+      rows.map((r, i) => ({
+        place: r.place != null ? r.place : i + 1,
+        name: r.name,
+        color: r.color,
+        isHuman: r.isPlayer != null ? !!r.isPlayer : !!r.isHuman,
+        time: r.time,
+        score: r.score,
+        balloons: r.balloons,
+      })),
+      {
+        onPlayAgain: () => { couchOverlay.hideResults(); couchPlayAgain(); },
+        onExit: () => returnToMenu(),
+      }
+    );
+  }
+}
+
+// ~10Hz 'couchState' → the server re-emits it verbatim as 'snapshot' to the
+// phones, whose controller UI (item slots, position, hit vibration) is unchanged
+// from the server-sim era.
+function emitCouchState(dt) {
+  _couchStateAccum += dt;
+  if (_couchStateAccum < 0.1) return;
+  _couchStateAccum = 0;
+  if (!socket || typeof socket.emit !== 'function' || !manager) return;
+
+  const karts = [];
+  if (manager.lapSystem && typeof manager.getHumanViews === 'function') {
+    // Racing (GP/TT): position + lap + item slots + spin per HUMAN kart.
+    const standings = manager.lapSystem.getStandings();
+    const rank = {};
+    for (let i = 0; i < standings.length; i++) rank[standings[i].id] = i + 1;
+    for (const v of manager.getHumanViews(0)) {
+      const racer = manager.getRacer(v.id);
+      if (!racer) continue;
+      const prog = manager.lapSystem.getProgress(v.id);
+      karts.push({
+        id: v.id,
+        pos: rank[v.id] || null,
+        lap: prog ? Math.min((prog.lap || 0) + 1, manager.totalLaps) : 1,
+        slots: manager.itemSystem && manager.itemSystem.hasItem(v.id)
+          ? manager.itemSystem.getSlots(v.id) : [],
+        spinTimer: racer.state.spinTimer || 0,
+      });
+    }
+  } else if (typeof manager.getCouchInfo === 'function') {
+    // Battle: balloons + score per human (Battle exposes getCouchInfo).
+    for (const row of manager.getCouchInfo()) karts.push(row);
+  }
+  if (karts.length) socket.emit('couchState', { karts });
+}
+
+// Per-paint view model for the TV overlay panels + leaderboard + battle clock.
+function buildOverlayFrame(alpha) {
+  const views = [];
+  let leaderboard = null;
+  let timeLeft = null;
+  const isTT = tvConfig && tvConfig.mode === 'tt';
+
+  if (manager.lapSystem && typeof manager.getHumanViews === 'function') {
+    const standings = manager.lapSystem.getStandings();
+    const rank = {};
+    for (let i = 0; i < standings.length; i++) rank[standings[i].id] = i + 1;
+    for (const v of manager.getHumanViews(alpha)) {
+      const prog = manager.lapSystem.getProgress(v.id);
+      views.push({
+        id: v.id,
+        name: v.name,
+        color: v.color,
+        info: {
+          pos: isTT ? null : (rank[v.id] || null),
+          totalRacers: manager.fieldSize,
+          lap: prog ? Math.min((prog.lap || 0) + 1, manager.totalLaps) : 1,
+          totalLaps: manager.totalLaps,
+          slots: manager.itemSystem && manager.itemSystem.hasItem(v.id)
+            ? manager.itemSystem.getSlots(v.id) : null,
+          balloons: null,
+          score: null,
+          lapTime: prog ? raceClock - prog.lapStart : 0,
+        },
+      });
+    }
+    if (!isTT) {
+      leaderboard = standings.map((s, i) => {
+        const r = manager.getRacer(s.id);
+        return { id: s.id, name: r ? r.name : s.id, color: r ? r.color : 0xffffff, place: i + 1 };
+      });
+    }
+  } else if (typeof manager.getCouchFrame === 'function') {
+    // Battle: the manager builds its own frame (balloons/score/clock).
+    return manager.getCouchFrame(alpha);
+  }
+  return { views, leaderboard, timeLeft };
+}
+
+// ----------------------------------------------------------------------------
 // 9. Return-to-menu path (Esc during a mode, BACK on select, or after MP ends).
 // ----------------------------------------------------------------------------
 function returnToMenu() {
@@ -730,6 +1089,23 @@ function returnToMenu() {
     lobby.dispose();
     lobby = null;
   }
+  // COUCH/TV: drop the QR lobby, the HERE/TV picker, the overlay, the input hub,
+  // and the persistent handlers; restore normal (non-split-screen) rendering.
+  playTargetSelect.hide();
+  if (couchLobby) {
+    couchLobby.dispose();
+    couchLobby = null;
+  }
+  if (couchOverlay) { couchOverlay.dispose(); couchOverlay = null; }
+  if (couchHub) { couchHub.dispose(); couchHub = null; }
+  if (_offCouchStart) { _offCouchStart(); _offCouchStart = null; }
+  if (_offCouchLeft) { _offCouchLeft(); _offCouchLeft = null; }
+  if (_offCouchReconnect) { _offCouchReconnect(); _offCouchReconnect = null; }
+  tvSetup = false;
+  tvConfig = null;
+  if (typeof renderer.setCouchMode === 'function') renderer.setCouchMode(false);
+  // Restore the single-player HUD hidden while in couch mode.
+  if (hud && hud.element) hud.element.style.display = '';
   if (socket && typeof socket.disconnect === 'function') {
     socket.disconnect();
   }
@@ -779,6 +1155,28 @@ function restartCurrentMode() {
   if (mode === 'gp') startGrandPrix();
   else if (mode === 'tt') startTimeTrial();
   else if (mode === 'battle') startBattle();
+  else if (mode === 'couch') couchPlayAgain(); // fresh 'start' → server rebroadcasts raceStart
+}
+
+// Toggle the pause-or-settings overlay for a LIVE race. Shared by the keyboard
+// (Esc/P) and the on-screen touch ⏸ button so both behave identically. Returns
+// true if it handled the input (opened/closed an overlay), false otherwise.
+function toggleRacePause() {
+  if (howToPlay && howToPlay._active) return true; // How-To owns input; swallow.
+  // An open overlay closes first (works in every context, including the menu ⚙).
+  if (_overlayOpen) { closeOverlay(); return true; }
+  // A LIVE single-player race -> freezing pause. raceOver/finished guard so a tap
+  // over the results board doesn't pop a pause menu. COUCH/TV runs the same LOCAL
+  // sim, so it pauses the same way (phones just stall until resume).
+  const inSoloRace = (mode === 'gp' || mode === 'tt' || mode === 'battle' || mode === 'couch')
+    && manager && !manager.raceOver && !manager.finished;
+  // A LIVE multiplayer race (manager exists = past the lobby) -> non-freezing panel.
+  const inMpRace = mode === 'mp' && manager;
+  if (inSoloRace || inMpRace) {
+    openOverlay(mode === 'mp' ? 'mp' : 'pause');
+    return true;
+  }
+  return false;
 }
 
 // Esc / P: toggle the pause-or-settings overlay during a race; otherwise Esc
@@ -788,25 +1186,17 @@ window.addEventListener('keydown', (e) => {
   if (howToPlay && howToPlay._active) return; // How-To-Play owns input; don't mutate pause/_overlayOpen behind it
   if (e.repeat) return; // ignore auto-repeat while held, else it double-toggles the pause overlay
 
-  // An open overlay closes first (works in every context, including the menu ⚙).
-  if (_overlayOpen) { closeOverlay(); return; }
-
-  // A LIVE single-player race -> freezing pause. raceOver/finished guard so Esc
-  // over the results board doesn't pop a pause menu.
-  const inSoloRace = (mode === 'gp' || mode === 'tt' || mode === 'battle')
-    && manager && !manager.raceOver && !manager.finished;
-  // A LIVE multiplayer race (manager exists = past the lobby) -> non-freezing panel.
-  const inMpRace = mode === 'mp' && manager;
-  if (inSoloRace || inMpRace) {
-    openOverlay(mode === 'mp' ? 'mp' : 'pause');
-    return;
-  }
+  if (toggleRacePause()) return;
+  // TV lobby (QR screen up, no race yet): Esc backs out to the menu below.
 
   // Pre-race screens (select/track/difficulty/lobby): Esc returns to the menu.
   if (e.key === 'Escape' && mode !== 'menu') {
     returnToMenu();
   }
 });
+
+// On-screen touch ⏸ (phones have no keyboard): same pause path as Esc/P.
+window.addEventListener('touchpause', () => { toggleRacePause(); });
 
 // ----------------------------------------------------------------------------
 // 10. AUDIO + VFX glue (central hooks; the smallest number of spots).
@@ -825,14 +1215,25 @@ function startRaceAudio() {
   // R11: drive the visual 3-2-1-GO overlay in lockstep with the beeps, and RELEASE
   // the start lock at GO so the frozen grid launches together (no start pile-up).
   // typeof guards keep this a safe no-op for TT/Battle/MP (only RaceManager defines release()).
-  _countdownTimers.push(setTimeout(() => { audio.sfxCountdown(3); if (typeof hud.showCountdown === 'function') hud.showCountdown(3); }, 0));
-  _countdownTimers.push(setTimeout(() => { audio.sfxCountdown(2); if (typeof hud.showCountdown === 'function') hud.showCountdown(2); }, 700));
-  _countdownTimers.push(setTimeout(() => { audio.sfxCountdown(1); if (typeof hud.showCountdown === 'function') hud.showCountdown(1); }, 1400));
+  _countdownTimers.push(setTimeout(() => { audio.sfxCountdown(3); showRaceCountdown(3); }, 0));
+  _countdownTimers.push(setTimeout(() => { audio.sfxCountdown(2); showRaceCountdown(2); }, 700));
+  _countdownTimers.push(setTimeout(() => { audio.sfxCountdown(1); showRaceCountdown(1); }, 1400));
   _countdownTimers.push(setTimeout(() => {
     audio.sfxCountdown(0);
-    if (typeof hud.showCountdown === 'function') hud.showCountdown(0);
+    showRaceCountdown(0);
     if (manager && typeof manager.release === 'function') manager.release();
   }, 2100));
+}
+
+// Drive the visual 3-2-1-GO countdown for the active mode. The single-player HUD
+// owns it normally; COUCH mode hides the HUD, so the TV's split-screen gets its own
+// big centered countdown from the CouchOverlay instead.
+function showRaceCountdown(n) {
+  if (mode === 'couch') {
+    if (couchOverlay) couchOverlay.showCountdown(n === 0 ? 'GO!' : String(n));
+  } else if (typeof hud.showCountdown === 'function') {
+    hud.showCountdown(n);
+  }
 }
 
 // Stop the engine drone and cancel any pending countdown beeps. Music keeps
@@ -1269,9 +1670,9 @@ function update(dt) {
     manager.update(dt);
   } else if (mode === 'battle' && manager) {
     manager.update(dt);
-    // When the match ends, show the POLISHED battle results board ONCE (ranked by
-    // balloons-remaining then survival order). Reuses the GP results screen + its
-    // button wiring; RESTART re-runs a battle, MENU returns home.
+    // When the match ends, show the POLISHED battle results board ONCE (ranked
+    // score-first: pops desc → balloons → earliest to the score). Reuses the GP
+    // results screen + its button wiring; RESTART re-runs a battle, MENU returns home.
     if (manager.finished && !_battleResultsShown) {
       _battleResultsShown = true;
       resultsScreen.showBattle(manager.getBattleResults(), {
@@ -1281,6 +1682,21 @@ function update(dt) {
     }
   } else if (mode === 'mp' && manager) {
     manager.update(dt);
+  } else if (mode === 'couch' && manager) {
+    // COUCH/TV: the LOCAL sim (RaceManager or Battle) — same fixed step as solo.
+    if (typeof manager.isLocked === 'function' ? !manager.isLocked() : true) raceClock += dt;
+    manager.update(dt, raceClock);
+    emitCouchState(dt);
+    // End-of-race edge: battles flip `finished`, races flip `raceOver`.
+    if (tvConfig && tvConfig.mode === 'battle') {
+      if (manager.finished && !_battleResultsShown) {
+        _battleResultsShown = true;
+        endTvRace(manager.getBattleResults());
+      }
+    } else if (manager.raceOver && !_resultsShown) {
+      _resultsShown = true;
+      endTvRace(manager.getResults());
+    }
   }
   // 'menu' / 'select' / 'track' modes: nothing to simulate.
 }
@@ -1307,6 +1723,11 @@ function render(alpha) {
     manager.render(alpha);
   } else if (mode === 'mp' && manager) {
     manager.render(alpha);
+  } else if (mode === 'couch' && manager) {
+    // Sync every kart mesh from the local sim (hud/renderer null → no single
+    // chase camera or solo HUD), then feed the TV overlay its per-frame frame.
+    manager.render(alpha, null, null, raceClock);
+    if (couchOverlay) couchOverlay.update(buildOverlayFrame(alpha));
   }
 
   // M6: drive the engine sound + particle FX off the active player's state. Runs
@@ -1338,8 +1759,15 @@ function render(alpha) {
     renderer.applyCameraFeel(camState, DT);
   }
 
-  // Draw the scene from the camera's point of view.
-  renderer.render();
+  // Draw the scene from the camera's point of view. COUCH MODE draws N split-
+  // screen viewports (one chase camera per human player) instead of the single
+  // full-screen camera; each phone sees its own kart on the TV.
+  if (mode === 'couch' && manager && typeof manager.getHumanViews === 'function') {
+    const states = manager.getHumanViews(alpha).map((v) => v.state);
+    renderer.renderSplitScreen(states, DT, (track && track.trackId) || 'circuit');
+  } else {
+    renderer.render();
+  }
 
   hud.stats.end();
 }
@@ -1367,7 +1795,9 @@ function syncDebug() {
   }
 
   window.__debug = {
-    mode,        // 'menu' | 'select' | 'track' | 'shop' | 'gp' | 'tt' | 'battle' | 'mp'
+    mode,        // 'menu' | 'select' | 'track' | 'shop' | 'gp' | 'tt' | 'battle' | 'mp' | 'couch'
+    tvConfig,    // COUCH/TV: the configured game, or null
+    couchOverlay, // COUCH/TV: the split-screen overlay, or null
     manager,
     race: manager,
     selection,

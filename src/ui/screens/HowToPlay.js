@@ -44,8 +44,8 @@ const MODE_INFO = {
   battle: {
     title: 'BALLOON BATTLE',
     accent: '#fb7185', accent2: '#ec4899', // rose -> pink (Menu Battle button)
-    desc: "You have 3 balloons. Grab items and HIT rivals to pop their balloons (a shell, bomb, or a solid ram pops one). Lose all 3 and you're OUT for good — last kart standing wins. The bots are fast and aggressive, so keep moving and pick your hits.",
-    objective: '3 balloons each. No respawns — lose them all and you spectate. Last kart standing wins.',
+    desc: 'You have 3 balloons. Grab items and HIT rivals to pop their balloons (a shell, bomb, or a solid ram pops one) — every pop scores a point. Lose all 3 and you respawn moments later with fresh balloons. Most pops when the clock runs out wins.',
+    objective: 'Timed score battle — pop balloons to score, respawn when you lose yours. Most pops wins.',
   },
   mp: {
     title: 'MULTIPLAYER',
@@ -189,7 +189,7 @@ export class HowToPlay {
     panel.appendChild(this._gamepadLine);
 
     const mobileLine = document.createElement('p');
-    mobileLine.textContent = 'Mobile — on-screen stick + buttons (no look-back, no pause button).';
+    mobileLine.textContent = 'Mobile — on-screen stick + buttons, plus a ⏸ pause button top-right (no look-back).';
     mobileLine.className = 'text-[11px] leading-snug text-slate-400';
     panel.appendChild(mobileLine);
 

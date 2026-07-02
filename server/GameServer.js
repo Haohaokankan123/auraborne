@@ -25,6 +25,8 @@
 //
 // Message contracts (see the project brief) — payloads stay small / plain numbers.
 
+import os from 'node:os';
+
 import { Room } from './Room.js';
 
 // How many human players a single room accepts before it is considered "full"
@@ -52,9 +54,20 @@ export class GameServer {
     // player's room and seat without scanning every room.
     this.players = new Map();
 
+    // COUCH MODE: socketId -> roomId for "screen" sockets. A screen is the TV
+    // client that shows the split-screen race but occupies NO kart slot — it
+    // joins the Socket.IO room group (so it receives lobby/raceStart/snapshot for
+    // ALL karts) without ever calling room.addPlayer. It also acts as the couch
+    // host: it is the one allowed to start the race.
+    this.screens = new Map();
+
     // Monotonic counters for stable, collision-free ids.
     this._nextRoomNum = 1;
     this._nextPlayerNum = 1;
+
+    // This machine's LAN (Wi-Fi) IPv4, sent to the couch TV so the join QR points
+    // at an address PHONES can actually reach (not localhost).
+    this._lanIp = this._detectLanIp();
 
     // Register the single connection handler. Everything else hangs off the
     // per-socket event handlers we wire up inside.
@@ -72,6 +85,11 @@ export class GameServer {
     // 'join' — the client announces itself and we seat it in a room.
     socket.on('join', (payload) => this._onJoin(socket, payload || {}));
 
+    // 'joinScreen' — COUCH MODE. The TV opens a fresh couch room and joins it as a
+    // seat-less screen. Phones then 'join' that room (via the QR's ?room=id) and
+    // become the players; the screen split-screens them.
+    socket.on('joinScreen', (payload) => this._onJoinScreen(socket, payload || {}));
+
     // 'ready' — toggle this player's lobby ready flag, then rebroadcast the lobby.
     socket.on('ready', (payload) => this._onReady(socket, payload || {}));
 
@@ -85,6 +103,12 @@ export class GameServer {
     // 'input' — a per-tick input snapshot during the race. Routed to the room,
     // which buffers the latest input per player for its fixed-step sim.
     socket.on('input', (payload) => this._onInput(socket, payload || {}));
+
+    // COUCH MODE relays from the TV (which runs the sim locally): the kart state
+    // fans out to the phones as 'snapshot'; the end of race reopens the lobby.
+    // 'input' above handles the phone -> TV direction.
+    socket.on('couchState', (payload) => this._onCouchState(socket, payload || {}));
+    socket.on('couchEnd', (payload) => this._onCouchEnd(socket, payload || {}));
 
     // 'disconnect' — clean the player out of its room (AI fills the seat if racing).
     socket.on('disconnect', () => this._onDisconnect(socket));
@@ -108,8 +132,9 @@ export class GameServer {
     if (!name) name = 'Player' + this._nextPlayerNum;
     if (name.length > 20) name = name.slice(0, 20);
 
-    // Find (or create) a room that is still open for joining.
-    const room = this._findOpenRoom();
+    // Resolve the room to seat this player in. A phone from the couch QR carries an
+    // explicit roomId — honour it when valid; otherwise auto-matchmake.
+    const room = this._resolveJoinRoom(payload.roomId);
 
     // Assign a stable player id (used as the kart id in the sim and snapshots).
     const playerId = 'p' + this._nextPlayerNum++;
@@ -139,6 +164,11 @@ export class GameServer {
    */
   _findOpenRoom() {
     for (const room of this.rooms.values()) {
+      // Skip couch rooms: they're joined ONLY via their explicit QR roomId, and sit
+      // with started=false between cup races / while awaiting RACE AGAIN. Without
+      // this guard a stranger clicking "Play Online" gets silently seated into a
+      // family's living-room game (it's often the only open room on a small server).
+      if (room.couch) continue;
       if (!room.started && room.humanCount() < MAX_HUMANS_PER_ROOM) {
         return room;
       }
@@ -148,6 +178,97 @@ export class GameServer {
     const room = new Room(id, this.io);
     this.rooms.set(id, room);
     return room;
+  }
+
+  /**
+   * Resolve which room a 'join' should land in. If an explicit roomId is given
+   * (a phone scanning the couch QR) and that room is open, use it; otherwise fall
+   * back to auto-matchmaking.
+   * @param {string} [roomId]
+   * @returns {Room}
+   * @private
+   */
+  _resolveJoinRoom(roomId) {
+    if (typeof roomId === 'string' && roomId) {
+      const r = this.rooms.get(roomId);
+      if (r && !r.started && r.humanCount() < MAX_HUMANS_PER_ROOM) return r;
+    }
+    return this._findOpenRoom();
+  }
+
+  // ------------------------------------------------------------------------
+  // JOIN SCREEN (couch): create a fresh couch room and join it seat-less.
+  // ------------------------------------------------------------------------
+  /**
+   * @param {import('socket.io').Socket} socket
+   * @private
+   */
+  _onJoinScreen(socket, payload) {
+    // A socket is either a screen or a player, never both.
+    if (this.players.has(socket.id) || this.screens.has(socket.id)) return;
+
+    // RECONNECT: the TV lost its socket (Wi-Fi blip / tab reload) and came back
+    // with a NEW socket.id. If it names a couch room it previously owned and that
+    // room is currently screen-less, re-seat THIS socket as that room's screen
+    // instead of minting a new room + QR — the phones never left, so the relay
+    // simply resumes and nobody has to re-scan. (Gated on payload.roomId, which
+    // only a reconnect sends, so the first-time join path below is unchanged.)
+    const wantId = payload && typeof payload.roomId === 'string' ? payload.roomId : null;
+    if (wantId) {
+      const existing = this.rooms.get(wantId);
+      if (existing && existing.couch && !this._roomHasScreen(wantId)) {
+        socket.join(existing.id);
+        this.screens.set(socket.id, existing.id);
+        socket.emit('joined', { playerId: null, roomId: existing.id, lanIp: this._lanIp });
+        // Only refresh the lobby if the race hasn't started — mid-race a stray
+        // 'lobby' could bounce the phones' controller UI back to the waiting state.
+        if (!existing.started) this._broadcastLobby(existing);
+        return;
+      }
+    }
+
+    // Always create a FRESH room so the couch session has its own private lobby;
+    // phones join it explicitly via the QR's ?room=id.
+    const id = 'room' + this._nextRoomNum++;
+    const room = new Room(id, this.io);
+    room.couch = true; // couch rooms are host-started from the TV (no 5s auto-start)
+    this.rooms.set(id, room);
+
+    // Join the broadcast group WITHOUT taking a kart slot, and record the mapping.
+    socket.join(room.id);
+    this.screens.set(socket.id, room.id);
+
+    // Tell the TV its room id + this machine's LAN IP, so the join QR points at an
+    // address phones can reach. We reuse the 'joined' contract (null playerId).
+    socket.emit('joined', { playerId: null, roomId: room.id, lanIp: this._lanIp });
+
+    // Broadcast the (empty) lobby so the TV shows its waiting/QR state immediately.
+    this._broadcastLobby(room);
+  }
+
+  /**
+   * Best-effort detect this machine's LAN IPv4 (for the couch join QR). Prefers
+   * the typical Mac Wi-Fi/Ethernet interfaces, then any non-internal IPv4.
+   * @returns {string|null}
+   * @private
+   */
+  _detectLanIp() {
+    const ifaces = os.networkInterfaces();
+    const order = ['en0', 'en1', ...Object.keys(ifaces)];
+    for (const name of order) {
+      for (const net of ifaces[name] || []) {
+        if (net.family === 'IPv4' && !net.internal) return net.address;
+      }
+    }
+    return null;
+  }
+
+  /** @returns {boolean} true if any screen socket is watching this room. @private */
+  _roomHasScreen(roomId) {
+    for (const rid of this.screens.values()) {
+      if (rid === roomId) return true;
+    }
+    return false;
   }
 
   // ------------------------------------------------------------------------
@@ -168,7 +289,8 @@ export class GameServer {
 
     // If at least one player is ready, arm an auto-start countdown (only once).
     // The host can still 'start' early; either way the room starts cleanly.
-    this._maybeArmAutostart(room);
+    // COUCH rooms are host-started from the TV — never auto-start them.
+    if (!room.couch) this._maybeArmAutostart(room);
 
     this._broadcastLobby(room);
   }
@@ -201,6 +323,36 @@ export class GameServer {
    * @private
    */
   _onStart(socket, payload) {
+    // COUCH: the TV/screen is the host — it may start its room regardless of who
+    // the first player was. It just needs at least one phone in the field.
+    // The TV simulates the race LOCALLY; the server never starts the Room sim for
+    // couch rooms. 'start' just flips the join gate and tells everyone to race.
+    const screenRoomId = this.screens.get(socket.id);
+    if (screenRoomId) {
+      const room = this.rooms.get(screenRoomId);
+      if (!room) return;
+      if (room.started) return; // race already live — ignore a duplicate start
+      // Need at least one human in the field: a phone, OR the TV's own local
+      // keyboard player (payload.kb — the TV adds that kart itself, so the
+      // server just has to let an otherwise-empty room start).
+      if (room.humanCount() < 1 && !(payload && payload.kb)) return;
+      if (payload && payload.trackId != null && typeof room.setTrack === 'function') {
+        room.setTrack(payload.trackId);
+      }
+      room.started = true; // blocks late joins (same gate the lobby join path checks)
+      // Everything the TV needs to boot its local sim + the phones need to switch
+      // to their racing UI. `players` is the same roster the 'lobby' event carries.
+      this.io.to(room.id).emit('raceStart', {
+        mode: payload.mode,
+        trackId: room.trackId, // resolved/validated by setTrack above
+        difficulty: payload.difficulty,
+        cup: payload.cup,
+        kb: !!(payload && payload.kb), // TV keyboard player joins the field locally
+        players: room.lobbyList().map((p) => ({ id: p.id, name: p.name, color: p.color })),
+      });
+      return;
+    }
+
     const seat = this.players.get(socket.id);
     if (!seat) return;
     const room = this.rooms.get(seat.roomId);
@@ -249,8 +401,22 @@ export class GameServer {
       clearTimeout(room._autostartTimer);
       room._autostartTimer = null;
     }
-    // When the race ends, drop the room if it has emptied out.
-    room.start(() => this._onRoomEnd(room));
+    // When the race ends, decide the room's fate (couch rooms survive for a rematch).
+    room.start(() => this._onRaceEnded(room));
+  }
+
+  /**
+   * A race finished. A normal room is torn down; a COUCH room whose TV is still
+   * connected is kept ALIVE (loop stopped) so the crew can press RACE AGAIN and
+   * rematch with the same phones — no new room, no QR re-scan. It's finally
+   * cleaned up when the screen disconnects (see _onDisconnect).
+   * @param {Room} room
+   * @private
+   */
+  _onRaceEnded(room) {
+    room.stop(); // idempotent
+    if (room.couch && this._roomHasScreen(room.id)) return; // keep for a rematch
+    this._onRoomEnd(room);
   }
 
   // ------------------------------------------------------------------------
@@ -266,8 +432,58 @@ export class GameServer {
     if (!seat) return;
     const room = this.rooms.get(seat.roomId);
     if (!room) return;
+    // COUCH: the TV runs the sim locally — relay the raw input to the room's
+    // screen socket(s) instead of the (never-started) Room sim.
+    if (room.couch) {
+      for (const [sid, rid] of this.screens) {
+        if (rid === room.id) {
+          this.io.to(sid).emit('couchInput', { playerId: seat.playerId, input: payload });
+        }
+      }
+      return;
+    }
     // The room buffers the LATEST input per player; the sim reads it each tick.
     room.setInput(seat.playerId, payload);
+  }
+
+  // ------------------------------------------------------------------------
+  // COUCH RELAYS: the TV's local sim streams through the server to the phones.
+  // ------------------------------------------------------------------------
+  /**
+   * COUCH: the TV streams its locally-simulated kart state — re-emit it VERBATIM
+   * as 'snapshot' to the room so the phones' HUDs update (the screen ignores its
+   * own echo).
+   * @param {import('socket.io').Socket} socket
+   * @param {{karts?:Array}} payload
+   * @private
+   */
+  _onCouchState(socket, payload) {
+    const room = this._couchRoomForScreen(socket);
+    if (!room) return;
+    this.io.to(room.id).emit('snapshot', payload);
+  }
+
+  /**
+   * COUCH: the TV's local race finished. Relay the results as 'raceEnd' and
+   * reopen the lobby so the same crew can press RACE AGAIN without re-scanning.
+   * @param {import('socket.io').Socket} socket
+   * @param {{results?:Array}} payload
+   * @private
+   */
+  _onCouchEnd(socket, payload) {
+    const room = this._couchRoomForScreen(socket);
+    if (!room) return;
+    this.io.to(room.id).emit('raceEnd', { results: payload.results });
+    room.started = false; // reopen the join gate for the rematch lobby
+    this._broadcastLobby(room);
+  }
+
+  /** Resolve the couch room a registered screen socket controls (or null). @private */
+  _couchRoomForScreen(socket) {
+    const roomId = this.screens.get(socket.id);
+    if (!roomId) return null;
+    const room = this.rooms.get(roomId);
+    return room && room.couch ? room : null;
   }
 
   // ------------------------------------------------------------------------
@@ -278,6 +494,20 @@ export class GameServer {
    * @private
    */
   _onDisconnect(socket) {
+    // COUCH: a screen (TV) disconnected — drop it, and end its room only if
+    // nothing else is watching or playing.
+    const screenRoomId = this.screens.get(socket.id);
+    if (screenRoomId) {
+      this.screens.delete(socket.id);
+      const room = this.rooms.get(screenRoomId);
+      // No screen and no phones = a dead couch room, whether or not it "started"
+      // (the sim runs on the TV that just left, so nothing can revive it).
+      if (room && room.humanCount() === 0 && !this._roomHasScreen(room.id)) {
+        this._onRoomEnd(room);
+      }
+      return;
+    }
+
     const seat = this.players.get(socket.id);
     if (!seat) return;
     this.players.delete(socket.id);
@@ -290,10 +520,18 @@ export class GameServer {
     room.removePlayer(seat.playerId);
 
     if (room.started) {
-      // Mid-race: the room handles AI takeover internally; nothing else to do
-      // except let it clean itself up when it ends.
-      // If everyone left, end the room now (no humans to watch it).
-      if (room.humanCount() === 0) {
+      if (room.couch) {
+        // COUCH: the TV runs the sim — tell it (and the phones) a racer dropped so
+        // it can hand the kart to a local AI. The Room sim never ran, so there is
+        // no server-side takeover. The room survives while the screen is watching.
+        this.io.to(room.id).emit('playerLeft', { playerId: seat.playerId, name: seat.name });
+        if (room.humanCount() === 0 && !this._roomHasScreen(room.id)) {
+          this._onRoomEnd(room);
+        }
+      } else if (room.humanCount() === 0) {
+        // Mid-race: the room handles AI takeover internally; nothing else to do
+        // except let it clean itself up when it ends.
+        // If everyone left, end the room now (no humans to watch it).
         room.stop();
         this._onRoomEnd(room);
       }
@@ -301,7 +539,13 @@ export class GameServer {
       // Still in the lobby: just rebroadcast the updated lobby, or drop the room
       // if it is now empty.
       if (room.humanCount() === 0) {
-        this._onRoomEnd(room);
+        // COUCH: keep the room alive if its TV screen is still watching (waiting
+        // for phones to (re)join) — otherwise the QR room would vanish.
+        if (room.couch && this._roomHasScreen(room.id)) {
+          this._broadcastLobby(room);
+        } else {
+          this._onRoomEnd(room);
+        }
       } else {
         this._broadcastLobby(room);
       }
@@ -320,6 +564,10 @@ export class GameServer {
     }
     room.stop(); // idempotent — safe even if already stopped
     this.rooms.delete(room.id);
+    // COUCH: forget any screen mappings for this room.
+    for (const [sid, rid] of this.screens) {
+      if (rid === room.id) this.screens.delete(sid);
+    }
   }
 
   // ------------------------------------------------------------------------

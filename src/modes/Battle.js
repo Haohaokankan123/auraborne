@@ -20,8 +20,9 @@
 // systems. Instead, each tick we watch every kart's spinTimer for a rising edge
 // (was ~0, now > 0): that means "this kart just got hit". On that edge we POP one
 // balloon (decrement the count, hide one floating balloon mesh) and let the brief
-// spin stand as the hit reaction. A kart at 0 balloons is OUT — hidden and pulled
-// from the combat lists. Last kart (or balloon leader at the time limit) wins.
+// spin stand as the hit reaction. Every pop scores the attacker a point. A kart
+// at 0 balloons is DOWNED — hidden for a short beat, then respawned with fresh
+// balloons + a brief spawn shield. Highest score when the timer expires wins.
 //
 // Conventions (match the project): Y up; XZ plane; forward = (sin h, 0, cos h).
 
@@ -44,25 +45,39 @@ import {
 } from '../../shared/kartModel.js';
 
 // --- Battle tuning (local to this mode; not shared kart physics) -------------
-const START_BALLOONS = 3;        // balloons each kart begins with
-const TIME_LIMIT = 90;           // s  match cap; if karts remain, most balloons (then kills) wins
-const HIT_POP_SPIN = 1.0;        // s  brief spin applied as the balloon-pop reaction
+// TIMED RESPAWN SCORE BATTLE (classic Mario Kart): every pop scores the attacker
+// a point. Losing all balloons DOWNS the kart briefly, then it respawns with
+// fresh balloons + a short spawn shield — nobody is ever eliminated. Highest
+// score when the timer expires wins (ties: balloons held, then earliest to
+// reach that score). Everything below lives in ONE object so a caller (couch/TV,
+// the headless harness) can override any value via opts.tuning; all code reads
+// this.tuning, never these defaults directly.
+// Values TUNED with scripts/tune-battle.mjs (headless bot-only matches, measured
+// per-AI pop averages): these land a SOLO battle's per-AI mean pops in the 40-80
+// band Charles asked for. The bottleneck is combat throughput (rams + fired
+// shells) not per-hit params, so the biggest lever is TIME_LIMIT (pops scale ~
+// linearly with match length) backed by a peak-density combat setup (generous
+// ram contact, quick recovery, fast item-box respawns so bots stay armed).
+// COUCH/TV overrides both AI_INTENSITY (0.5, gentler bots) AND TIME_LIMIT (240,
+// a shorter match) so phone players — who steer with a harder control — face a
+// 20-40 per-AI band instead. See beginTvRace in src/main.js.
+const BATTLE_TUNING = {
+  TIME_LIMIT: 360,        // s   match length; most pops when it expires wins (solo)
+  RESPAWN_DELAY: 1.2,     // s   downed (0 balloons) -> back in the arena (fast = more targets)
+  SPAWN_SHIELD: 1.2,      // s   post-respawn pop immunity (rams/hits can't pop)
+  HIT_POP_SPIN: 0.45,     // s   spin cap applied on a balloon pop (quick recovery = higher pace)
+  RAM_CONTACT: 4.5,       // m   center distance counting as a body-to-body hit
+  RAM_APPROACH: 3.5,      // m/s how hard the attacker must drive INTO the victim to pop
+  RAM_COOLDOWN: 0.3,      // s   per-victim guard so one crash pops exactly one balloon
+  AI_FIRE_COOLDOWN: 0.28, // s   base bot fire cadence (divided by AI_INTENSITY)
+  AI_AIM_LEAD: 0.45,      // s   intercept lead the bots aim ahead of a moving target
+  BOX_RESPAWN: 0.7,       // s   arena item boxes come back fast so bots stay armed
+  AI_INTENSITY: 1.0,      // scales bot offense (fire rate/ranges/aim); couch/TV passes 0.5
+};
+
+const START_BALLOONS = 3;        // balloons each kart begins (and respawns) with
 const SPIN_EDGE_EPS = 0.05;      // s  spinTimer above this counts as "freshly hit"
-const ITEM_BOX_RESPAWN_HINT = 3; // (boxes respawn via ItemBoxManager's own timer)
-
-// SUDDEN-DEATH ELIMINATION (per Charles): NO respawns. When a kart's last balloon
-// pops it is OUT for good — last kart standing wins. An eliminated PLAYER drops into
-// a free-fly SPECTATOR camera (still bounded by the arena) to watch the finish.
-// We still tally `score` = balloons you popped (kills), used only to rank the fallen
-// and flavour the standings — survival is what wins.
-
-// RAM-to-pop tuning (client-only bumper-car combat; never touches shared physics).
-// Tightened for the harder, faster meta: rams connect more readily so high-speed
-// aggression is rewarded and contact is decisive.
-const RAM_CONTACT = 3.2;         // m   center distance counting as a body-to-body hit (forgiving so "drive into them" connects)
-const RAM_APPROACH = 7;          // m/s how hard the attacker must be driving TOWARD the other to pop it (lower = more crashes land)
-const RAM_COOLDOWN = 0.6;        // s   per-victim guard so one crash pops exactly one balloon
-const POP_CREDIT_RADIUS = 3.0;   // m   how near a player projectile must be to credit a pop
+const POP_CREDIT_RADIUS = 3.0;   // m  how near a snapshotted projectile must be to credit a pop
 
 // PACE + ANTI-STUCK tuning (client-only; battle is single-player vs bots, so no parity concern).
 // HARDER + FASTER (Charles: "make it ~10x harder, enemies aggressive, everything fast"):
@@ -92,7 +107,7 @@ const BALLOON_COLORS = [0xff5566, 0x44bbff, 0xffe14d];
 // items are fired when a rival is lined up AHEAD; DEFENSIVE traps are dropped on a
 // chaser closing from BEHIND (or while evading). Everything else (mushroom/star/
 // lightning/boo/coin/superHorn) is a self/area effect the bot uses to commit while
-// hunting, fleeing, or dodging. Mirrors AIRacer's by-category firing idea.
+// hunting or dodging. Mirrors AIRacer's by-category firing idea.
 const FORWARD_ITEMS = new Set(['greenShell', 'redShell', 'tripleGreen', 'tripleRed', 'bulletBill', 'blueShell']);
 const DEFENSIVE_ITEMS = new Set(['banana', 'tripleBanana', 'fakeBox', 'bobOmb']);
 
@@ -109,12 +124,25 @@ export class Battle {
    *                   stepKart scales the player's physics. Omitted => neutral.
    *        - color  : player kart body color (any THREE.Color input).
    * @param {number} [opts.fieldSize=8]   total karts = 1 player + (fieldSize-1) bots.
+   * @param {object} [opts.tuning]        shallow overrides of BATTLE_TUNING (see top).
+   * @param {boolean} [opts.botPlayer]    drive the "player" record with the bot AI
+   *        (headless harness / demo seam — opts.input is then never read).
+   * @param {Array}  [opts.humans]        COUCH/TV roster: [{id, name, color,
+   *        inputProvider}] — each phone drives its own kart via inputProvider
+   *        .getState() (Input-shaped). When present there is NO 'player' record:
+   *        humans take the first spawn slots, bots fill to fieldSize, and the TV
+   *        renders split-screen (so opts.renderer/hud should be omitted).
    */
-  constructor({ scene, renderer, input, hud, audio = null, vfx = null, selection = {}, fieldSize = 8 }) {
+  constructor({ scene, renderer, input, hud, audio = null, vfx = null, selection = {}, fieldSize = 8, tuning = null, botPlayer = false, humans = null }) {
     this.scene = scene;
     this.renderer = renderer;
     this.input = input;
     this.hud = hud;
+    // Effective tuning: the defaults, shallow-merged with any caller overrides.
+    this.tuning = Object.assign({}, BATTLE_TUNING, tuning || {});
+    this.botPlayer = !!botPlayer;
+    // COUCH/TV roster (or null for the classic solo field).
+    this.humans = Array.isArray(humans) && humans.length ? humans : null;
     // AudioManager (optional): used for the balloon-pop SFX + final-10s beeps. All
     // calls are guarded so a missing audio system never throws.
     this.audio = audio;
@@ -143,8 +171,11 @@ export class Battle {
     this.projectiles = new ProjectileSystem(scene, this.arena);
     // World item boxes. ItemBoxManager places boxes along a Track's checkpoints,
     // so we hand it a thin ADAPTER that presents the arena's scattered itemSpawns
-    // as single-box "checkpoints" (see _makeBoxAdapter). Reused unchanged.
-    this.itemBoxes = new ItemBoxManager(this._makeBoxAdapter(), scene);
+    // as single-box "checkpoints" (see _makeBoxAdapter). Battle boxes respawn
+    // FAST (BOX_RESPAWN) so everyone re-arms promptly and the pop rate stays high.
+    this.itemBoxes = new ItemBoxManager(this._makeBoxAdapter(), scene, {
+      respawnTime: this.tuning.BOX_RESPAWN,
+    });
 
     // --- Build the field of karts. -----------------------------------------
     // Each record: { id, state, kart, isPlayer, balloons, balloonMeshes[],
@@ -166,29 +197,20 @@ export class Battle {
     // confetti play, then flip `finished` so main.js shows the polished board.
     this._ending = false;      // true during the brief end flourish (sim frozen).
     this._endTimer = 0;        // seconds left in the flourish before results.
-    this._endReason = null;    // 'timeout' (the only end condition now; shapes the banner).
-    // Monotonic knockout counter -> survival ranking (later out = better place).
-    this._knockoutSeq = 0;
     // Last integer second we beeped, so the final-10s countdown beeps once/second.
     this._lastBeepSec = null;
     // One-shot guard for the match-start objective banner (shows HOW to pop).
     this._objectiveShown = false;
-    // Reused flat [x,z,x,z,...] snapshot of the player's live projectiles, taken
-    // BEFORE projectiles.update so a pop can be credited to the player's shell/bomb
+    // Reused flat [x, z, ownerId, ...] snapshot of ALL live offensive projectiles,
+    // taken BEFORE projectiles.update so a pop can be credited to whoever fired
     // (the hitting projectile is recycled by the time pops resolve). Alloc-free.
-    this._playerProjScratch = [];
+    this._projScratch = [];
 
     // Scratch context reused for the simple bot AI each tick (no per-tick alloc).
     this._aiCtx = {};
 
     // Remember the player's last steer so render() angles the front wheels.
     this._playerLastSteer = 0;
-
-    // SPECTATOR: set true when the player is eliminated -> render() drives a free-fly
-    // camera (_specPos/_specYaw) from the player's input instead of the chase cam.
-    this._spectating = false;
-    this._specPos = null;
-    this._specYaw = 0;
 
     // SUPER-HORN shockwave: one reusable flat ring on the floor, expanded + faded by
     // render() on each blast so the horn reads as a real area pulse (it was invisible).
@@ -276,15 +298,21 @@ export class Battle {
    */
   _buildField() {
     const spawns = this.arena.spawnPoints;
+    // COUCH/TV: the humans roster takes the first spawn slots (no 'player'
+    // record at all); bots fill the rest. Solo = 1 player + (fieldSize-1) bots.
+    const humans = this.humans;
+    const humanCount = humans ? humans.length : 1;
     for (let i = 0; i < this.fieldSize; i++) {
-      const isPlayer = i === 0;
-      const id = isPlayer ? 'player' : 'bot' + i;
+      const roster = humans && i < humanCount ? humans[i] : null;
+      const isPlayer = !humans && i === 0;
+      const isHuman = isPlayer || !!roster;
+      const id = roster ? roster.id : (isPlayer ? 'player' : 'bot' + i);
 
       // Spawn pose from the arena ring (wrap if somehow short).
       const pose = spawns[i % spawns.length];
 
       // State: the player's carries the selection stats so stepKart scales its
-      // physics; bots use the neutral default (no stats => identical to today).
+      // physics; bots + TV humans use the neutral default (phones pick no stats).
       const stateOpts = {
         x: pose.x, y: pose.y, z: pose.z, heading: pose.heading,
       };
@@ -299,13 +327,17 @@ export class Battle {
       //     adds an organic, hard-to-read wobble to their pathing; skill sharpens
       //     steering + reactions. Randomised per battle so no two matches feel the same.
       // HARDER FIELD: no rookies anymore — every bot is aggressive and sharp, aces near max.
-      const aggression = isPlayer ? 0 : 0.82 + Math.random() * 0.18;  // 0.82 .. 1.0 (all aggressive)
-      const skill = isPlayer ? 0 : 0.85 + Math.random() * 0.15;       // 0.85 .. 1.0 (all crisp/quick)
+      // With opts.botPlayer the "player" record is a bot too, so it rolls the same spread.
+      const botDriven = !isHuman || (isPlayer && this.botPlayer);
+      const aggression = botDriven ? 0.82 + Math.random() * 0.18 : 0;  // 0.82 .. 1.0 (all aggressive)
+      const skill = botDriven ? 0.85 + Math.random() * 0.15 : 0;       // 0.85 .. 1.0 (all crisp/quick)
 
-      // Visual kart, colored per player selection / bot palette.
-      const color = isPlayer
-        ? (this.selection.color != null ? this.selection.color : 0xff3b30)
-        : BOT_COLORS[(i - 1) % BOT_COLORS.length];
+      // Visual kart, colored per player selection / lobby swatch / bot palette.
+      const color = roster && roster.color != null
+        ? roster.color
+        : isPlayer
+          ? (this.selection.color != null ? this.selection.color : 0xff3b30)
+          : BOT_COLORS[Math.max(0, i - humanCount) % BOT_COLORS.length];
       const kart = new Kart({ color });
       this.scene.add(kart.group);
 
@@ -319,13 +351,26 @@ export class Battle {
         kart,
         color,            // kart body tint (echoed as the results-row colour chip)
         isPlayer,
+        // COUCH/TV: true for the solo player AND every phone player — the "a
+        // human drives this" flag (speed cap, bot hunt bias, results tagging).
+        isHuman,
+        // Phone roster fields: the lobby name + the relayed-input source (null
+        // for the solo player, who reads this.input, and for bots).
+        name: roster ? roster.name || null : null,
+        inputProvider: roster ? roster.inputProvider || null : null,
         balloons: START_BALLOONS,
         balloonMeshes,
-        alive: true,
-        // SCORE = balloons this kart has popped on others (its KILL count). Not the win
-        // metric — survival is — but it ranks the fallen and flavours the standings panel.
+        alive: true,      // false only while DOWNED (waiting out the respawn delay)
+        // SCORE = balloons this kart has popped on others. THE win metric: most
+        // pops when the timer expires wins.
         score: 0,
-        outOrder: 0,      // elimination sequence (0 = still alive); higher = knocked out later
+        // Battle-clock stamp of the latest point scored — the "earliest to reach
+        // the score" tie-break (null until the first pop lands).
+        _lastScoreAt: null,
+        // Respawn bookkeeping: countdown while downed, and the clock time until
+        // which the fresh spawn shield holds (pops against a shielded kart skip).
+        _respawnTimer: 0,
+        _shieldUntil: 0,
 
         // Previous-tick spinTimer, for the rising-edge "just got hit" detection.
         prevSpin: 0,
@@ -340,7 +385,7 @@ export class Battle {
         _input: null,
         _prevUseItem: false,
         // Roam state for the bot AI: a persistent random arena point it heads toward
-        // when not hunting/fleeing, so the field stays spread out instead of clumping.
+        // when not hunting, so the field stays spread out instead of clumping.
         aiRoamX: null,
         aiRoamZ: null,
         aiRoamTimer: 0,
@@ -357,7 +402,12 @@ export class Battle {
         aiSkill: skill,
         // ~45% of bots are dedicated PLAYER-HUNTERS: they always chase the human, so
         // there's constant pressure (the rest brawl opportunistically). See _botInput.
-        aiHunter: !isPlayer && Math.random() < 0.45,
+        aiHunter: !isHuman && Math.random() < 0.45,
+        // Which human this hunter locks onto: the solo player, or a random phone
+        // player on TV — so every human feels the same constant pressure.
+        aiHunterTargetId: humans
+          ? humans[Math.floor(Math.random() * humanCount)].id
+          : 'player',
         aiSpeedCap: BOT_SPEED_CAP_MIN + aggression * (BOT_SPEED_CAP_MAX - BOT_SPEED_CAP_MIN),
         aiWeavePhase: Math.random() * Math.PI * 2,       // desync each bot's wobble
         aiWeaveFreq: 1.1 + Math.random() * 1.4,          // rad/s of the steering wobble
@@ -468,15 +518,14 @@ export class Battle {
 
     this.clock += dt;
 
-    // MATCH-START OBJECTIVE: the moment combat begins, name HOW to pop a balloon
-    // using the REAL controls (items = SHIFT/E held, ram = drive into a rival at
-    // speed). This is the single biggest comprehension fix — the player no longer
-    // has to guess. One DOM/GSAP banner (low-tier safe), fired exactly once.
+    // MATCH-START OBJECTIVE: the moment combat begins, name the goal + the rules
+    // (items = SHIFT/E, ram = drive into a rival at speed; respawns are free).
+    // One DOM/GSAP banner (low-tier safe), fired exactly once.
     if (!this._objectiveShown) {
       this._objectiveShown = true;
       if (this.hud && typeof this.hud.showRewardBanner === 'function') {
         this.hud.showRewardBanner(
-          '🎈 POP TO SCORE — ram rivals or hit them with items (SHIFT / CLICK). Most pops in 90s wins!',
+          '🎈 MOST POPS WINS — respawn when you lose your balloons! Ram rivals or hit them with items (SHIFT).',
           'alert',
           2.0
         );
@@ -486,7 +535,7 @@ export class Battle {
     // FINAL-10s urgency beep: once per second over the last 10 seconds, rising in
     // pitch as it closes (sfxCountdown: lower n = higher/urgent). The visual pulse
     // lives on the HUD clock (fed timeLeft in render()).
-    const secsLeft = Math.ceil(TIME_LIMIT - this.clock);
+    const secsLeft = Math.ceil(this.tuning.TIME_LIMIT - this.clock);
     if (secsLeft <= 10 && secsLeft > 0 && secsLeft !== this._lastBeepSec) {
       this._lastBeepSec = secsLeft;
       if (this.audio && typeof this.audio.sfxCountdown === 'function') {
@@ -494,7 +543,16 @@ export class Battle {
       }
     }
 
-    // Live combat list = only karts that still have balloons. ItemBox/Projectile
+    // DOWNED karts sit out combat entirely (hidden, no physics/AI) while their
+    // respawn delay ticks down, then rejoin with fresh balloons + a spawn shield.
+    for (let i = 0; i < this.karts.length; i++) {
+      const rec = this.karts[i];
+      if (rec.alive) continue;
+      rec._respawnTimer -= dt;
+      if (rec._respawnTimer <= 0) this._respawn(rec);
+    }
+
+    // Live combat list = only karts that aren't downed. ItemBox/Projectile
     // systems read .id/.state, which our records expose, so we hand them the
     // alive subset directly.
     const alive = this._aliveKarts();
@@ -515,11 +573,15 @@ export class Battle {
       pt.z = rec.state.z;
       pt.heading = rec.state.heading;
 
-      // Input: player reads the controls; bots compute the same input shape.
+      // Input: player reads the controls; TV humans read their phone's relayed
+      // input (same Input shape); bots compute the same shape themselves.
+      // With opts.botPlayer the player record is bot-driven too (headless seam).
       let input;
-      if (rec.isPlayer) {
+      if (rec.isPlayer && !this.botPlayer) {
         input = this.input.getState();
         this._playerLastSteer = input.steer;
+      } else if (rec.inputProvider) {
+        input = rec.inputProvider.getState();
       } else {
         input = this._botInput(rec, alive, dt);
       }
@@ -539,7 +601,10 @@ export class Battle {
       // top-speed limiter; sub-cap accel is untouched, so it stays responsive.
       const st = rec.state;
       const boosting = st.boostTimer > 0 || st.starTimer > 0 || st.overdriveTimer > 0;
-      const cap = rec.isPlayer ? PLAYER_SPEED_CAP : rec.aiSpeedCap;
+      // Every human-driven kart (solo player OR phone player) gets the player
+      // cap; bot-driven karts (incl. an AI takeover of a dropped phone) get theirs.
+      const humanDriven = rec.inputProvider != null || (rec.isPlayer && !this.botPlayer);
+      const cap = humanDriven ? PLAYER_SPEED_CAP : rec.aiSpeedCap;
       if (!boosting && st.speed > cap) st.speed = cap;
     }
 
@@ -570,10 +635,10 @@ export class Battle {
     // --- 4. Projectiles: move/home/bounce/collide vs the alive karts. -------
     // On a hit the projectile system sets state.spinTimer (via applySpin). We do
     // NOT let that stand as a full race spin-out — step 5 converts it to a pop.
-    // Snapshot the player's live projectiles FIRST: a hitting projectile is recycled
-    // during update(), so this pre-shot positions list is how we credit a shell/bomb
-    // pop to the player (see _playerProjectileNear).
-    this._snapshotPlayerProjectiles();
+    // Snapshot ALL live projectiles FIRST: a hitting projectile is recycled
+    // during update(), so this pre-impact list is how we credit a shell/bomb
+    // pop to whoever fired it (see _nearestProjectileOwner).
+    this._snapshotProjectiles();
     this.projectiles.update(dt, alive);
 
     // --- 4.5 RAM pops: a hard body-to-body contact at speed pops the struck
@@ -586,7 +651,7 @@ export class Battle {
     // --- 5. Balloon pops: detect fresh hits (spinTimer rising edge). --------
     this._resolveBalloonHits(alive);
 
-    // --- 6. Win check: one kart left, or the timer ran out. -----------------
+    // --- 6. Win check: the timer ran out (the only end condition). ----------
     this._checkWinner();
   }
 
@@ -599,11 +664,11 @@ export class Battle {
    * @private
    */
   _useItemFor(rec, alive) {
-    // Flat standings: order alive karts by balloon count (leader-first-ish) so
+    // Flat standings: order alive karts by SCORE (the win metric) so
     // leader-seeking items (blue shell) still pick a sensible victim.
     const standings = alive
       .slice()
-      .sort((a, b) => b.balloons - a.balloons)
+      .sort((a, b) => (b.score - a.score) || (b.balloons - a.balloons))
       .map((r) => ({ id: r.id }));
 
     const action = this.itemSystem.useItem(rec.id, rec.state, {
@@ -654,20 +719,21 @@ export class Battle {
   }
 
   /**
-   * Blue-shell-style strike: spin the alive kart with the MOST balloons (that
-   * isn't the firer), unless invincible. We also launch a redShell visual toward
-   * the field for on-screen feedback. The spin becomes a balloon pop in step 5.
+   * Blue-shell-style strike: spin the alive kart with the HIGHEST score (that
+   * isn't the firer), unless invincible/shielded. We also launch a redShell visual
+   * toward the field for on-screen feedback. The spin becomes a balloon pop in step 5.
    * @private
    */
   _fireLeaderStrike(rec, alive, action) {
     let leader = null;
     for (let i = 0; i < alive.length; i++) {
       const r = alive[i];
-      if (r.id === rec.id) continue;
-      if (!leader || r.balloons > leader.balloons) leader = r;
+      if (r.id === rec.id || this._isShielded(r)) continue;
+      if (!leader || r.score > leader.score ||
+          (r.score === leader.score && r.balloons > leader.balloons)) leader = r;
     }
     if (!leader) return;
-    const secs = action && action.spinSecs ? action.spinSecs : HIT_POP_SPIN;
+    const secs = action && action.spinSecs ? action.spinSecs : this.tuning.HIT_POP_SPIN;
     if (!isInvincible(leader.state)) {
       // Apply the spin directly (the model's applySpin guards invincibility); the
       // rising-edge detector then pops a balloon.
@@ -693,11 +759,12 @@ export class Battle {
     this._emitShockwave(ox, oz);
     for (let i = 0; i < alive.length; i++) {
       const other = alive[i];
-      if (other.id === rec.id) continue;
+      if (other.id === rec.id || this._isShielded(other)) continue;
       const dx = other.state.x - ox;
       const dz = other.state.z - oz;
       if (dx * dx + dz * dz <= R2 && !isInvincible(other.state)) {
-        if (HIT_POP_SPIN > other.state.spinTimer) other.state.spinTimer = HIT_POP_SPIN;
+        const secs = this.tuning.HIT_POP_SPIN;
+        if (secs > other.state.spinTimer) other.state.spinTimer = secs;
         // Credit the horn user so a player blast shows the green "POP!" confirm.
         other.poppedBy = rec.id;
       }
@@ -733,7 +800,8 @@ export class Battle {
    * @private
    */
   _resolveRamHits(alive) {
-    const R2 = RAM_CONTACT * RAM_CONTACT;
+    const t = this.tuning;
+    const R2 = t.RAM_CONTACT * t.RAM_CONTACT;
     const now = this.clock;
     for (let i = 0; i < alive.length; i++) {
       const a = alive[i];
@@ -759,56 +827,64 @@ export class Battle {
         let attacker, victim, approach;
         if (approachA >= approachB) { attacker = a; victim = b; approach = approachA; }
         else { attacker = b; victim = a; approach = approachB; }
-        if (approach < RAM_APPROACH) continue; // glancing / drafting — not a real crash
+        if (approach < t.RAM_APPROACH) continue; // glancing / drafting — not a real crash
         const vs = victim.state;
         if (now < (victim._ramCooldownUntil || 0)) continue; // still in pop cooldown
+        if (this._isShielded(victim)) continue; // fresh respawn — pop immunity
         if (vs.spinTimer > SPIN_EDGE_EPS || isInvincible(vs)) continue; // mid-pop / starred
-        vs.spinTimer = HIT_POP_SPIN;          // -> a pop in _resolveBalloonHits
+        vs.spinTimer = t.HIT_POP_SPIN;        // -> a pop in _resolveBalloonHits
         victim.poppedBy = attacker.id;        // attribution for the scoring cue
-        victim._ramCooldownUntil = now + RAM_COOLDOWN;
+        victim._ramCooldownUntil = now + t.RAM_COOLDOWN;
       }
     }
   }
 
   /**
-   * Snapshot the player's live (non-cosmetic) projectile positions into a reused
-   * flat [x,z,x,z,...] array. Taken BEFORE projectiles.update, because a projectile
-   * that lands a hit is recycled the same tick — this pre-impact list is how
-   * _playerProjectileNear later credits a shell/bomb pop to the player.
+   * Snapshot EVERY live (non-cosmetic) projectile into a reused flat
+   * [x, z, ownerId, ...] array. Taken BEFORE projectiles.update, because a
+   * projectile that lands a hit is recycled the same tick — this pre-impact list
+   * is how _nearestProjectileOwner later credits a shell/bomb pop to whoever
+   * fired it (player AND bots; bot pops previously credited nobody).
    * @private
    */
-  _snapshotPlayerProjectiles() {
-    const snap = this._playerProjScratch;
+  _snapshotProjectiles() {
+    const snap = this._projScratch;
     snap.length = 0;
     const pool = this.projectiles && this.projectiles._pool;
     if (!pool) return;
     for (let i = 0; i < pool.length; i++) {
       const p = pool[i];
-      if (p && p.active && p.ownerId === 'player' && !p.cosmetic) {
-        snap.push(p.mesh.position.x, p.mesh.position.z);
+      if (p && p.active && !p.cosmetic) {
+        snap.push(p.mesh.position.x, p.mesh.position.z, p.ownerId);
       }
     }
   }
 
   /**
-   * True if one of the player's snapshotted projectiles was within POP_CREDIT_RADIUS
-   * of this kart state — i.e. the player's shell/bomb most likely caused the pop.
+   * The owner id of the NEAREST snapshotted projectile within POP_CREDIT_RADIUS
+   * of this kart state (excluding the victim's own shots) — i.e. whose shell/bomb
+   * most likely caused the pop. Null when nothing qualifies.
    * ponytail: positional heuristic (a projectile is recycled before pops resolve, so
    * exact owner isn't readable without editing the shared projectile system). Worst
    * case is a rare cosmetic mis-credit when two shots overlap — never a sim bug.
-   * @param {object} state
-   * @returns {boolean}
+   * @param {object} state    the victim's kart state.
+   * @param {string} selfId   the victim's id (self-shots never credit).
+   * @returns {string|null}
    * @private
    */
-  _playerProjectileNear(state) {
-    const snap = this._playerProjScratch;
-    const R2 = POP_CREDIT_RADIUS * POP_CREDIT_RADIUS;
-    for (let i = 0; i < snap.length; i += 2) {
+  _nearestProjectileOwner(state, selfId) {
+    const snap = this._projScratch;
+    let best = null;
+    let bestD2 = POP_CREDIT_RADIUS * POP_CREDIT_RADIUS;
+    for (let i = 0; i < snap.length; i += 3) {
+      const owner = snap[i + 2];
+      if (owner == null || owner === selfId) continue;
       const dx = snap[i] - state.x;
       const dz = snap[i + 1] - state.z;
-      if (dx * dx + dz * dz <= R2) return true;
+      const d2 = dx * dx + dz * dz;
+      if (d2 <= bestD2) { bestD2 = d2; best = owner; }
     }
-    return false;
+    return best;
   }
 
   /**
@@ -833,9 +909,10 @@ export class Battle {
 
   /**
    * Convert fresh hits into balloon pops. A kart whose spinTimer just rose from
-   * ~0 to > 0 (and isn't invincible) was hit this tick: pop one balloon. We cap
-   * the standing spin to a brief HIT_POP_SPIN so a battle hit is a quick stumble,
-   * not a long race-style spin-out. A kart reaching 0 balloons is knocked OUT.
+   * ~0 to > 0 (and isn't invincible/shielded) was hit this tick: pop one balloon.
+   * We cap the standing spin to a brief HIT_POP_SPIN so a battle hit is a quick
+   * stumble, not a long race-style spin-out. A kart reaching 0 balloons is DOWNED
+   * (respawns shortly), never eliminated.
    * @param {Array} alive
    * @private
    */
@@ -843,21 +920,28 @@ export class Battle {
     for (let i = 0; i < alive.length; i++) {
       const rec = alive[i];
       const s = rec.state;
-      // Rising edge: it was effectively not spinning before, and is now.
-      const justHit = rec.prevSpin <= SPIN_EDGE_EPS && s.spinTimer > SPIN_EDGE_EPS;
+      // A hit this tick, even mid-recovery. spinTimer only ever DECAYS on its own
+      // (per-tick dt countdown), so any tick where it ROSE means an external hit
+      // fired — whether from a clean 0 (first pop) or on top of a decaying stumble
+      // (a re-hit inside the ~0.45s recovery window). Catching the re-hit case is
+      // what stops pops being silently dropped and mis-credited to a stale attacker.
+      const justHit = s.spinTimer > SPIN_EDGE_EPS &&
+        (rec.prevSpin <= SPIN_EDGE_EPS || s.spinTimer > rec.prevSpin + 1e-6);
       if (!justHit) continue;
-      // A starred kart shouldn't have been spun at all, but guard anyway.
-      if (isInvincible(s)) {
+      // A starred kart shouldn't have been spun at all, but guard anyway. A fresh
+      // spawn shield likewise absorbs the hit — clear the spin, no pop.
+      if (isInvincible(s) || this._isShielded(rec)) {
         s.spinTimer = 0;
+        rec.poppedBy = null;
         continue;
       }
-      // Trim the spin to a brief pop reaction.
-      if (s.spinTimer > HIT_POP_SPIN) s.spinTimer = HIT_POP_SPIN;
-      // Credit a projectile pop to the player if (and only if) one of the player's
-      // own shells/bombs was right beside this victim just before impact, and the
-      // pop wasn't already attributed by the ram pass / a player special.
-      if (!rec.poppedBy && rec.id !== 'player' && this._playerProjectileNear(s)) {
-        rec.poppedBy = 'player';
+      // Trim the spin to a brief pop reaction (quick recovery keeps the pace up).
+      if (s.spinTimer > this.tuning.HIT_POP_SPIN) s.spinTimer = this.tuning.HIT_POP_SPIN;
+      // Credit a projectile pop to whoever fired the nearest shell/bomb beside
+      // this victim just before impact (player AND bots), unless the pop was
+      // already attributed by the ram pass / a special.
+      if (!rec.poppedBy) {
+        rec.poppedBy = this._nearestProjectileOwner(s, rec.id);
       }
       this._popBalloon(rec);
     }
@@ -865,7 +949,7 @@ export class Battle {
 
   /**
    * Pop one balloon on a kart: hide the highest remaining balloon mesh, decrement
-   * the count, and if it hits 0 knock the kart OUT (hide it + clear its items).
+   * the count, and if it hits 0 DOWN the kart (hidden briefly, then respawned).
    * @param {object} rec
    * @private
    */
@@ -886,16 +970,20 @@ export class Battle {
 
     // SCORE: the popper earns a point for every balloon they burst (player AND bots —
     // bots compete for the win too). poppedBy is the attacker id from the ram pass /
-    // projectile credit / a player special; ignore self-pops (shouldn't happen).
+    // projectile credit / a special; ignore self-pops (shouldn't happen). The clock
+    // stamp is the "earliest to reach the score" tie-break.
     const scoredByPlayer = rec.poppedBy === 'player';
     const attacker = rec.poppedBy ? this._kartById.get(rec.poppedBy) : null;
-    if (attacker && attacker.id !== rec.id) attacker.score += 1;
+    if (attacker && attacker.id !== rec.id) {
+      attacker.score += 1;
+      attacker._lastScoreAt = this.clock;
+    }
 
     // READABLE CUE so every balloon change is understood (the feedback loop the
     // player said was missing). When the player LOSES one: an urgent "-1" cue (the
     // red screen flash already comes from main.js). When the player SCORES one off
-    // a rival: a green "+1" confirm naming the victim. Suppressed on the KILLING
-    // pop — _eliminate's banner says it better and would otherwise be clobbered.
+    // a rival: a green "+1" confirm naming the victim. Suppressed on the DOWNING
+    // pop — _down's banner says it better and would otherwise be clobbered.
     if (rec.balloons > 0 && this.hud && typeof this.hud.showRewardBanner === 'function') {
       if (rec.isPlayer) {
         this.hud.showRewardBanner('POP!  -1 balloon', 'alert');
@@ -905,7 +993,7 @@ export class Battle {
     }
 
     if (rec.balloons <= 0) {
-      this._eliminate(rec, scoredByPlayer);
+      this._down(rec, scoredByPlayer);
     }
     // Attribution is single-use: clear it so a later pop from another source can't
     // inherit a stale "scored by" credit.
@@ -913,44 +1001,113 @@ export class Battle {
   }
 
   /**
-   * ELIMINATE a kart whose last balloon just popped — OUT for good (no respawn, per
-   * Charles). Hide its visual, drop its items, and stamp its elimination order (later
-   * out = survived longer = better placing). When the PLAYER is eliminated we flip on
-   * the free-fly SPECTATOR camera so they roam the arena and watch the finish. The
-   * record stays in this.karts for the final board; _aliveKarts() filters it from combat.
+   * DOWN a kart whose last balloon just popped: hide it, drop its items, and start
+   * the respawn countdown (update() calls _respawn when it expires). Score persists —
+   * being downed only costs the RESPAWN_DELAY of arena time. The record stays in
+   * this.karts; _aliveKarts() filters it from combat while it's down.
    * @param {object} rec
-   * @param {boolean} [scoredByPlayer]  the player landed the finishing pop.
+   * @param {boolean} [scoredByPlayer]  the player landed the downing pop.
    * @private
    */
-  _eliminate(rec, scoredByPlayer = false) {
+  _down(rec, scoredByPlayer = false) {
     rec.alive = false;
-    rec.outOrder = ++this._knockoutSeq; // later elimination = survived longer = better place
+    rec._respawnTimer = this.tuning.RESPAWN_DELAY;
     rec.kart.group.visible = false;
+    // Freeze the state so the (hidden) kart doesn't keep coasting or spinning.
+    rec.state.speed = 0;
+    rec.state.spinTimer = 0;
     this.itemSystem.clear(rec.id);
 
     const canBanner = this.hud && typeof this.hud.showRewardBanner === 'function';
-
     if (rec.isPlayer) {
-      // Player is OUT for good -> drop into the free-fly spectator camera, seeded at the
-      // death spot. A bold, longer alert + a rose screen wash so "you're out" is clear.
-      this._spectating = true;
-      this._specPos = { x: rec.state.x, y: 14, z: rec.state.z };
-      this._specYaw = rec.state.heading;
-      if (canBanner) this.hud.showRewardBanner('💀 KNOCKED OUT — fly around to spectate (WASD)', 'alert', 2.2);
-      if (typeof this.hud._pulseFlash === 'function') {
-        this.hud._pulseFlash('rgba(244, 63, 94, 0.55)', 0.6, 0.7); // rose-500 wash
-      }
+      // The camera stays on the kart (it holds its down spot, then jumps to the
+      // respawn point); a centered banner covers the brief black-out beat.
+      if (canBanner) this.hud.showRewardBanner('RESPAWNING...', 'alert', this.tuning.RESPAWN_DELAY);
       return;
     }
-
-    // Bot elimination feed: name who's out, crediting the player when they landed it.
-    // Skip when this knockout IS the match-ender — _beginEnding's win banner says it.
-    if (this.getAliveCount() > 1 && canBanner) {
-      const who = this._displayName(rec);
-      this.hud.showRewardBanner(
-        scoredByPlayer ? '💥 You knocked out ' + who + '!' : '💥 ' + who + ' is OUT!'
-      );
+    // Downed-bot feed: credit the player when they landed the downing pop.
+    if (canBanner && scoredByPlayer) {
+      this.hud.showRewardBanner('💥 You downed ' + this._displayName(rec) + '!');
     }
+  }
+
+  /**
+   * Respawn a downed kart: fresh balloons, zeroed motion, a short spawn shield,
+   * placed at the arena spawn point FARTHEST from the living rivals (so it isn't
+   * instantly re-popped by the brawl that just downed it).
+   * @param {object} rec
+   * @private
+   */
+  _respawn(rec) {
+    const pose = this._farthestSpawn(rec);
+    const s = rec.state;
+    s.x = pose.x;
+    s.y = pose.y || 0;
+    s.z = pose.z;
+    s.heading = pose.heading || 0;
+    s.speed = 0;
+    s.vy = 0;
+    s.airborne = false;
+    s.spinTimer = 0;
+    // Seed the interpolation pair at the spawn pose so the first frame doesn't
+    // smear the kart across the arena from its death spot.
+    const pt = rec.prevTransform;
+    pt.x = s.x;
+    pt.y = s.y;
+    pt.z = s.z;
+    pt.heading = s.heading;
+
+    rec.balloons = START_BALLOONS;
+    for (let i = 0; i < rec.balloonMeshes.length; i++) rec.balloonMeshes[i].visible = true;
+    rec.alive = true;
+    rec._respawnTimer = 0;
+    rec.kart.group.visible = true;
+    rec._shieldUntil = this.clock + this.tuning.SPAWN_SHIELD;
+    rec.poppedBy = null;
+    rec.prevSpin = 0;
+    rec._ramCooldownUntil = 0;
+    // Reset the anti-stuck watchdog (the teleport would read as a huge "move").
+    rec._lastX = null;
+    rec._lastZ = null;
+    rec._stuckTimer = 0;
+    rec._escapeTimer = 0;
+  }
+
+  /**
+   * The arena spawn pose farthest from every LIVING rival — maximin over the
+   * spawn ring. Falls back to the first spawn when there are no rivals up.
+   * @param {object} rec  the respawning kart (excluded from the rival set).
+   * @returns {{x:number,y:number,z:number,heading:number}}
+   * @private
+   */
+  _farthestSpawn(rec) {
+    const spawns = this.arena.spawnPoints;
+    let best = spawns[0];
+    let bestMin = -1;
+    for (let i = 0; i < spawns.length; i++) {
+      const sp = spawns[i];
+      let minD2 = Infinity;
+      for (let k = 0; k < this.karts.length; k++) {
+        const o = this.karts[k];
+        if (o === rec || !o.alive) continue;
+        const dx = o.state.x - sp.x;
+        const dz = o.state.z - sp.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < minD2) minD2 = d2;
+      }
+      if (minD2 > bestMin) { bestMin = minD2; best = sp; }
+    }
+    return best;
+  }
+
+  /**
+   * True while a kart's post-respawn spawn shield holds (pops against it skip).
+   * @param {object} rec
+   * @returns {boolean}
+   * @private
+   */
+  _isShielded(rec) {
+    return this.clock < (rec._shieldUntil || 0);
   }
 
   /**
@@ -963,39 +1120,40 @@ export class Battle {
    */
   _displayName(rec) {
     if (rec.isPlayer) return this.selection.name || 'You';
+    if (rec.name) return rec.name; // COUCH/TV: the phone's lobby name
     return 'CPU ' + String(rec.id).replace('bot', '');
   }
 
   /**
-   * Decide the battle outcome (sudden-death elimination). Win conditions:
-   *   - one (or zero) kart left alive  -> LAST STANDING wins, OR
-   *   - the clock hits TIME_LIMIT      -> among the survivors, most balloons wins,
-   *     ties broken by most kills (score), then surviving longest (outOrder).
-   * On a decision we set winnerId + begin the end flourish.
+   * Decide the battle outcome: TIMER ONLY (nobody is ever eliminated). When the
+   * clock hits TIME_LIMIT the highest SCORE wins — ties broken by balloons held,
+   * then by who reached their score earliest. Sets winnerId + begins the end
+   * flourish.
    * @private
    */
   _checkWinner() {
     if (this._ending || this.finished) return;
-    const alive = this._aliveKarts();
+    if (this.clock < this.tuning.TIME_LIMIT) return;
+    const ranked = this._rankKarts();
+    this.winnerId = ranked.length > 0 ? ranked[0].id : null;
+    this._beginEnding();
+  }
 
-    if (alive.length <= 1) {
-      this.winnerId = alive.length === 1 ? alive[0].id : null;
-      this._beginEnding('lastStanding');
-      return;
-    }
-    if (this.clock >= TIME_LIMIT) {
-      let best = alive[0];
-      for (let i = 1; i < alive.length; i++) {
-        const r = alive[i];
-        if (r.balloons > best.balloons) { best = r; continue; }
-        if (r.balloons === best.balloons) {
-          if (r.score > best.score) { best = r; continue; }
-          if (r.score === best.score && r.outOrder > best.outOrder) best = r;
-        }
-      }
-      this.winnerId = best ? best.id : null;
-      this._beginEnding('timeout');
-    }
+  /**
+   * Every kart sorted best-first by the win metric: SCORE desc, then balloons
+   * held, then earliest to reach that score. Shared by _checkWinner and
+   * getBattleResults so the winner and the board can never disagree.
+   * @returns {Array} sorted copy of this.karts.
+   * @private
+   */
+  _rankKarts() {
+    return this.karts.slice().sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (b.balloons !== a.balloons) return b.balloons - a.balloons;
+      const at = a._lastScoreAt != null ? a._lastScoreAt : Infinity;
+      const bt = b._lastScoreAt != null ? b._lastScoreAt : Infinity;
+      return at === bt ? 0 : (at < bt ? -1 : 1);
+    });
   }
 
   /**
@@ -1003,27 +1161,24 @@ export class Battle {
    * banner, and let the win celebration (confetti + fanfare, fired by main.js on
    * the `finished` edge) play. After a short beat, _finish() flips `finished` so
    * the polished results board is shown by the mode router.
-   * @param {'lastStanding'|'timeout'} reason  why the match ended (shapes the banner).
    * @private
    */
-  _beginEnding(reason) {
+  _beginEnding() {
     if (this._ending || this.finished) return;
     this._ending = true;
-    this._endReason = reason;
     this._endTimer = 1.6; // s — banner + confetti beat before the board
 
-    // Banner: a clear, kid-friendly outcome. Last-standing leads with the survivor;
-    // a timeout leads with "TIME!" and names the balloon leader.
+    // Banner: a clear, kid-friendly outcome — "TIME!" + the pop leader.
     const winner = this.winnerId ? this._kartById.get(this.winnerId) : null;
     const playerWon = this.winnerId === 'player';
     let msg;
     if (!winner) {
-      msg = reason === 'timeout' ? "⏱ TIME! It's a draw!" : "It's a draw!";
+      msg = "⏱ TIME! It's a draw!";
     } else if (playerWon) {
-      msg = reason === 'timeout' ? '⏱ TIME! You survive — you win!' : '🏆 LAST ONE STANDING — you win!';
+      msg = '⏱ TIME! Most pops — you win!';
     } else {
-      const who = this._displayName(winner);
-      msg = (reason === 'timeout' ? '⏱ TIME! ' : '🏆 ') + who + ' wins';
+      msg = '⏱ TIME! ' + this._displayName(winner) + ' wins with ' + winner.score +
+        ' pop' + (winner.score === 1 ? '' : 's');
     }
     if (this.hud && typeof this.hud.showRewardBanner === 'function') {
       this.hud.showRewardBanner(msg);
@@ -1054,29 +1209,132 @@ export class Battle {
 
   /**
    * Build the final standings for the results board, best-first. Ranking is by
-   * SCORE (pops landed) DESC, then by balloons currently held, then by surviving
-   * longest since the last wipeout — matching _checkWinner's winner pick. Each entry
-   * carries what the board needs: place, name, colour chip, isPlayer, score, balloons.
+   * SCORE (pops landed) DESC, then balloons held, then earliest to reach the
+   * score — the same _rankKarts order _checkWinner picks the winner from. Each
+   * entry carries what the board needs: place, name, colour chip, isPlayer,
+   * score, balloons.
    * @returns {Array<{place:number,id:string,name:string,color:number,
-   *                   isPlayer:boolean,score:number,balloons:number,eliminated:boolean}>}
+   *                   isPlayer:boolean,score:number,balloons:number}>}
    */
   getBattleResults() {
-    const ranked = this.karts.slice().sort((a, b) => {
-      if (a.alive !== b.alive) return a.alive ? -1 : 1;          // survivors above the eliminated
-      if (b.balloons !== a.balloons) return b.balloons - a.balloons; // then balloons held
-      if (b.score !== a.score) return b.score - a.score;         // then most kills
-      return b.outOrder - a.outOrder;                            // then survived longest
-    });
-    return ranked.map((rec, i) => ({
+    return this._rankKarts().map((rec, i) => ({
       place: i + 1,
       id: rec.id,
       name: this._displayName(rec),
       color: rec.color,
       isPlayer: rec.isPlayer,
-      score: rec.score,            // kills (pops landed) — shown alongside the placing
+      isHuman: rec.isHuman, // COUCH/TV: phone players tag as human on the board
+      score: rec.score,            // pops landed — the win metric
       balloons: Math.max(0, rec.balloons),
-      eliminated: !rec.alive,
     }));
+  }
+
+  // ========================================================================
+  // COUCH/TV seam — the same accessors RaceManager exposes, so main.js's TV
+  // path (split-screen render, overlay frames, phone snapshots, AI takeover)
+  // treats a battle exactly like a race. All no-op/empty when solo.
+  // ========================================================================
+  /**
+   * One render-interpolated view per roster human, in join order, for the
+   * split-screen renderer + overlay. A downed kart keeps its view (the quadrant
+   * holds on the respawn spot). Empty when solo.
+   * @param {number} alpha  render interpolation factor in [0, 1).
+   * @returns {Array<{id:string, name:string, color:number|string, state:object}>}
+   */
+  getHumanViews(alpha) {
+    if (!this.humans) return [];
+    const out = [];
+    for (let i = 0; i < this.humans.length; i++) {
+      const rec = this._kartById.get(this.humans[i].id);
+      if (!rec) continue;
+      out.push({
+        id: rec.id,
+        name: this._displayName(rec),
+        color: rec.color,
+        state: makeRenderState(rec.prevTransform, rec.state, alpha),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * A phone dropped mid-battle: hand its kart to the bot AI (same personality
+   * spread the bots roll) so the brawl carries on. Idempotent.
+   * @param {string} id  the human record id (server playerId).
+   * @returns {boolean} whether a takeover actually happened.
+   */
+  replaceWithAI(id) {
+    const rec = this._kartById.get(id);
+    if (!rec || !rec.isHuman) return false;
+    rec.isHuman = false;
+    rec.inputProvider = null;
+    rec.aiAggression = 0.82 + Math.random() * 0.18;
+    rec.aiSkill = 0.85 + Math.random() * 0.15;
+    rec.aiSpeedCap = BOT_SPEED_CAP_MIN + rec.aiAggression * (BOT_SPEED_CAP_MAX - BOT_SPEED_CAP_MIN);
+    rec.aiHunter = false;
+    return true;
+  }
+
+  /**
+   * Per-human rows for the phones' 'snapshot' UI (item slots, standing, hit
+   * vibration): { id, pos, lap:null, score, balloons, slots, spinTimer }.
+   * @returns {Array<object>}
+   */
+  getCouchInfo() {
+    if (!this.humans) return [];
+    const standings = this._buildStandings();
+    const rankById = {};
+    for (let i = 0; i < standings.length; i++) rankById[standings[i].id] = i + 1;
+    const out = [];
+    for (let i = 0; i < this.humans.length; i++) {
+      const rec = this._kartById.get(this.humans[i].id);
+      if (!rec) continue;
+      out.push({
+        id: rec.id,
+        pos: rankById[rec.id] || null,
+        lap: null,
+        score: rec.score,
+        balloons: Math.max(0, rec.balloons),
+        slots: this.itemSystem.hasItem(rec.id) ? this.itemSystem.getSlots(rec.id) : [],
+        spinTimer: rec.state.spinTimer || 0,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * The TV overlay's per-paint frame: quadrant panels (🎈 balloons + ★score),
+   * the score-first leaderboard, and the match clock.
+   * @param {number} alpha  render interpolation factor in [0, 1).
+   * @returns {{views:Array, leaderboard:Array, timeLeft:number}}
+   */
+  getCouchFrame(alpha) {
+    const standings = this._buildStandings();
+    const rankById = {};
+    for (let i = 0; i < standings.length; i++) rankById[standings[i].id] = i + 1;
+    const views = [];
+    for (const v of this.getHumanViews(alpha)) {
+      const rec = this._kartById.get(v.id);
+      views.push({
+        id: v.id,
+        name: v.name,
+        color: v.color,
+        info: {
+          pos: rankById[v.id] || null,
+          totalRacers: this.karts.length,
+          lap: null,
+          totalLaps: null,
+          slots: this.itemSystem.hasItem(v.id) ? this.itemSystem.getSlots(v.id) : null,
+          balloons: rec ? Math.max(0, rec.balloons) : 0,
+          score: rec ? rec.score : 0,
+          lapTime: null,
+        },
+      });
+    }
+    const leaderboard = standings.map((s, i) => ({
+      id: s.id, name: s.name, color: s.color, place: i + 1,
+    }));
+    return { views, leaderboard, timeLeft: Math.max(0, this.tuning.TIME_LIMIT - this.clock) };
   }
 
   // ========================================================================
@@ -1086,10 +1344,10 @@ export class Battle {
    * Produce an input snapshot for one FIGHTING bot. Decision order each tick:
    *   1. DODGE — if an enemy projectile/trap is closing inside the dodge radius,
    *      swerve perpendicular to it (toward open space) to evade the hit.
-   *   2. FLEE — if down to its last balloon and a rival is near, run from them
-   *      (biased back toward center) to protect the lead it has left.
-   *   3. HUNT — otherwise chase the nearest balloon-carrying rival.
-   *   4. WANDER — nobody in range: roam toward a slowly-changing center-biased goal.
+   *   2. HUNT — chase the weighted target (respawns are free, so a wounded bot
+   *      never flees — it presses the attack).
+   *   3. ARM UP — unarmed with no rival in ram range: grab the nearest item box.
+   *   4. WANDER — nobody in range: roam toward a persistent spread-out goal.
    * Plus: TACTICAL item use by held-item category (forward shells when a rival is
    * lined up ahead, traps when chased, boosts/effects while committing), drift for
    * mini-turbos on hard fast turns, and hard wall avoidance so bots never grind the
@@ -1155,7 +1413,7 @@ export class Battle {
       // the human (they should make the player's life hard), while rookies stay more
       // opportunistic and skirmish with whoever's near.
       const score = Math.sqrt(d2)
-        - (o.isPlayer ? 55 * rec.aiAggression : 0)        // hunt the human HARD — no turtling in a corner
+        - (o.isHuman ? 55 * rec.aiAggression : 0)         // hunt the humans HARD — no turtling in a corner
         - (START_BALLOONS - o.balloons) * 7;              // finish the wounded
       if (score < bestScore) { bestScore = score; target = o; bestD2 = d2; }
     }
@@ -1165,8 +1423,8 @@ export class Battle {
     // pressure and can't turtle in a corner while the bots brawl each other. The rest
     // stay opportunistic (the weighted target above). This is the core "harder" lever.
     if (rec.aiHunter) {
-      const human = this._kartById.get('player');
-      if (human && human.alive) {
+      const human = this._kartById.get(rec.aiHunterTargetId || 'player');
+      if (human && human.alive && human.isHuman) {
         const dx = human.state.x - s.x;
         const dz = human.state.z - s.z;
         target = human;
@@ -1224,53 +1482,58 @@ export class Battle {
       }
     }
 
-    // --- Pick the heading GOAL by priority: dodge > flee > ram > arm-up > hunt > roam.
-    //     Hunt range scales with aggression so rookies only commit to a near rival
-    //     (~26m) while aces pursue from across the arena (~50m). A SHORT base range +
-    //     separation keeps the field from collapsing into one clump (the old bug);
-    //     unarmed bots peel off to grab a box, which spreads them out further.
+    // --- Pick the heading GOAL by priority: dodge > ram > arm-up > hunt > roam.
+    //     There's NO flee state: with free respawns a wounded bot has nothing to
+    //     protect — it presses the attack (it still dodges projectiles above).
+    //     AI_INTENSITY scales every commit range (couch/TV passes 0.5 for a
+    //     gentler field; 1.0 = full offense). Unarmed bots peel off to grab a
+    //     box, which keeps them dangerous and spreads the field out.
+    const it = Math.max(this.tuning.AI_INTENSITY, 0.25);
+    const lead = this.tuning.AI_AIM_LEAD;
     const hasItem = this.itemSystem.hasItem(rec.id);
-    const RAM_RANGE2 = 28 * 28;                              // commit to a kill on any near rival
+    const ramRange = 28 * it;                                // commit-to-the-crash range (intensity-gated)
+    const RAM_RANGE2 = ramRange * ramRange;
     // Hunt range scales with aggression. When the TARGET is the player it's much
     // longer (covers the arena) so bots actively run the human down from anywhere —
     // the human should always be under pressure, not ignored when it sits still.
     const huntingPlayer = !!(target && target.isPlayer);
-    const huntRange = huntingPlayer
+    const huntRange = (huntingPlayer
       ? 80 + rec.aiAggression * 70                           // ~138 .. 150 m — the whole arena; nowhere to hide
-      : 26 + rec.aiAggression * 24;                          // ~26 .. 50 metres for bot-vs-bot
+      : 26 + rec.aiAggression * 24) * it;                    // ~26 .. 50 metres for bot-vs-bot
     const huntRange2 = huntRange * huntRange;
     let goalX;
     let goalZ;
     let chasing = false;
-    let fleeing = false;
+    // ARM-UP FIRST: an unarmed bot with a box nearby grabs it even when a rival
+    // is in ram range — with 8 karts in one arena somebody is ALWAYS near, so
+    // without this bots never pick up items and shells never contribute pops.
+    const armUp = !hasItem && boxX != null && boxD2 < 60 * 60;
     if (dodgeX != null) {
       goalX = dodgeX;
       goalZ = dodgeZ;
-    } else if (rec.balloons <= 1 && target && nearestD2 < 30 * 30 && rec.aiAggression < 0.8) {
-      // On the LAST balloon a non-ace plays safe: flee the nearest rival, biased to center.
-      // (Aces stay aggressive even when low — they go down swinging.)
-      const ax = s.x - target.state.x;
-      const az = s.z - target.state.z;
-      const al = Math.hypot(ax, az) || 1;
-      goalX = s.x + (ax / al) * 20 - s.x * 0.25;
-      goalZ = s.z + (az / al) * 20 - s.z * 0.25;
-      fleeing = true;
+      rec._aiMode = 'dodge';
+    } else if (armUp) {
+      goalX = boxX;
+      goalZ = boxZ;
+      rec._aiMode = 'arm';
     } else if (target && bestD2 < RAM_RANGE2) {
       // A rival is in ram range — commit to the crash regardless of item state. Aim at an
       // INTERCEPT point (lead the target by its velocity) so the bot cuts the rival off and
       // actually connects, instead of tail-chasing a moving target and orbiting it forever.
-      goalX = target.state.x + Math.sin(target.state.heading) * target.state.speed * 0.45;
-      goalZ = target.state.z + Math.cos(target.state.heading) * target.state.speed * 0.45;
+      goalX = target.state.x + Math.sin(target.state.heading) * target.state.speed * lead;
+      goalZ = target.state.z + Math.cos(target.state.heading) * target.state.speed * lead;
       chasing = true;
-    } else if (!hasItem && boxX != null && boxD2 < 55 * 55) {
-      // Unarmed: go grab a power-up so the bot can actually fight (and it spreads out).
+      rec._aiMode = 'ram';
+    } else if (!hasItem && boxX != null && boxD2 < 70 * 70) {
+      // Unarmed: go grab a power-up PROMPTLY so the bot can actually fight (and it
+      // spreads out). Wide range + fast box respawns keep the whole field armed.
       goalX = boxX;
       goalZ = boxZ;
     } else if (target && bestD2 < huntRange2) {
       // Armed (or just aggressive): pursue the weighted target across the arena, leading
       // its motion so the bot closes the gap on an intercept course rather than the tail.
-      goalX = target.state.x + Math.sin(target.state.heading) * target.state.speed * 0.45;
-      goalZ = target.state.z + Math.cos(target.state.heading) * target.state.speed * 0.45;
+      goalX = target.state.x + Math.sin(target.state.heading) * target.state.speed * lead;
+      goalZ = target.state.z + Math.cos(target.state.heading) * target.state.speed * lead;
       chasing = true;
     } else {
       // ROAM: drive toward a persistent random point spread across the arena, re-rolled
@@ -1293,7 +1556,11 @@ export class Battle {
     // kill. When committing we damp BOTH separation and the weave so the bot actually
     // connects the crash — otherwise separation rings several attackers around the prey
     // at arm's length and nobody ever lands the hit (the player would never get popped).
-    const committing = chasing && bestD2 < RAM_RANGE2;
+    // ARRIVING at a box counts as a commit too: the 2.6m pickup circle is tiny at
+    // cruise speed, so the weave/separation nudges below would make bots orbit a
+    // box forever without ever grabbing it.
+    const arriving = armUp && boxD2 < 22 * 22;
+    const committing = (chasing && bestD2 < RAM_RANGE2) || arriving;
 
     // --- SEPARATION (anti-clump). Repel from any OTHER BOT crowding us — but never
     //     from the player (bots SHOULD hunt the human) nor from our own ram prey
@@ -1304,7 +1571,7 @@ export class Battle {
     let sepZ = 0;
     for (let i = 0; i < alive.length; i++) {
       const o = alive[i];
-      if (o.id === rec.id || o.isPlayer) continue;
+      if (o.id === rec.id || o.isHuman) continue; // never repel from a human — bots SHOULD hunt them
       if (target && o.id === target.id) continue;
       const ox = s.x - o.state.x;
       const oz = s.z - o.state.z;
@@ -1328,7 +1595,7 @@ export class Battle {
     const nearWall =
       s.x < b.minX + MARGIN || s.x > b.maxX - MARGIN ||
       s.z < b.minZ + MARGIN || s.z > b.maxZ - MARGIN;
-    if (nearWall) {
+    if (nearWall && !arriving) { // arriving exempt: the outer boxes sit inside the margin
       goalX = goalX * 0.2; // 80% toward center
       goalZ = goalZ * 0.2;
     }
@@ -1344,6 +1611,12 @@ export class Battle {
     delta = Math.atan2(Math.sin(delta), Math.cos(delta));
     let steer = delta * (1.5 + rec.aiSkill * 0.6);
     steer += Math.sin(this.clock * rec.aiWeaveFreq + rec.aiWeavePhase) * rec.aiWeaveAmp * (committing ? 0.2 : 1);
+    // AIM NOISE (intensity < 1): a smooth angular error while chasing, scaled by
+    // (1 - intensity), so a softened field lines shots/rams up sloppily and
+    // misses more — the couch/TV "half aggression" lever.
+    if (chasing && it < 1) {
+      steer += Math.sin(this.clock * 2.3 + rec.aiWeavePhase) * (1 - it) * 0.6;
+    }
     if (steer > 1) steer = 1;
     else if (steer < -1) steer = -1;
     const absSteer = Math.abs(steer);
@@ -1353,13 +1626,17 @@ export class Battle {
     let throttle = 1 - absSteer * 0.35;
     if (nearWall && absSteer > 0.6) throttle = 0.55;
     if (throttle < 0.4) throttle = 0.4;
+    // Final approach to a box: shed speed so the turn circle shrinks inside the
+    // 2.6m pickup radius — full speed just orbits the box forever.
+    if (arriving && absSteer > 0.35) throttle = 0.25;
 
     // --- Drift on hard, fast turns for a mini-turbo — but NOT while hugging a
     //     wall (drift cuts the turn authority needed to peel away). -----------
     const drift = absSteer > 0.55 && Math.abs(s.speed) > 12 && !nearWall;
 
-    // --- TACTICAL item use by held-item category + geometry. Aces fire from further
-    //     and more often (shorter cooldown) than rookies. ---------------------------
+    // --- TACTICAL item use by held-item category + geometry. Fire cadence and
+    //     commit range both scale with AI_INTENSITY (0.5 => half the cadence,
+    //     shorter reach), so the couch/TV field shoots slower and misses more. ---
     let useItem = false;
     if (rec.aiItemCooldown <= 0) {
       const held = this.itemSystem.getHeld(rec.id);
@@ -1374,7 +1651,7 @@ export class Battle {
           inFront = Math.abs(td) < 1.0;                              // within ~57deg ahead
           behindClose = Math.abs(td) > 2.2 && nearestD2 < 18 * 18;   // a close chaser
         }
-        const fireRange = 30 + rec.aiAggression * 14;                // ~30..44 m
+        const fireRange = (30 + rec.aiAggression * 14) * it;         // ~30..44 m at full intensity
         const fireRange2 = fireRange * fireRange;
         if (FORWARD_ITEMS.has(heldId)) {
           useItem = !!target && inFront && bestD2 < fireRange2;       // rival lined up ahead
@@ -1382,10 +1659,10 @@ export class Battle {
           useItem = behindClose || dodgeX != null;                   // chaser / evading
         } else {
           // Self / area effect (boost/star/lightning/boo/...): use it to commit
-          // whenever actively hunting, fleeing, or dodging.
-          useItem = chasing || fleeing || dodgeX != null;
+          // whenever actively hunting or dodging.
+          useItem = chasing || dodgeX != null;
         }
-        if (useItem) rec.aiItemCooldown = 0.7 - rec.aiAggression * 0.3; // aces fire ~2x as often
+        if (useItem) rec.aiItemCooldown = this.tuning.AI_FIRE_COOLDOWN / it;
       }
     }
 
@@ -1397,7 +1674,7 @@ export class Battle {
   // ========================================================================
   /**
    * Sync every kart visual, float the balloons, follow the camera on the player
-   * (or a survivor if the player is out), and refresh the HUD.
+   * (it stays on the kart through a down/respawn), and refresh the HUD.
    * @param {number} alpha  the loop's [0, 1) interpolation factor between the
    *                        PREVIOUS and CURRENT physics ticks. We blend each kart's
    *                        prevTransform->state by this to draw a smooth in-between
@@ -1431,22 +1708,16 @@ export class Battle {
       if (k >= 1) { sw.active = false; sw.mesh.visible = false; }
     }
 
-    // 2) Camera. While the player is in, a normal chase cam. Once the player is
-    //    ELIMINATED we hand them a free-fly SPECTATOR camera (driven by their input,
-    //    clamped to the arena) so they roam and watch the finish instead of being
-    //    yanked onto a survivor.
-    if (this._spectating) {
-      this._updateSpectatorCamera(DT);
-    } else {
-      const cameraTarget = this._cameraTarget();
-      if (cameraTarget && this.renderer &&
-          typeof this.renderer.updateChaseCamera === 'function') {
-        const camRs = makeRenderState(cameraTarget.prevTransform, cameraTarget.state, alpha);
-        this.renderer.updateChaseCamera(camRs, DT);
-      }
+    // 2) Camera: a chase cam on the player, always — while downed the kart holds
+    //    its spot (hidden) so the camera stays put through the respawn beat.
+    const cameraTarget = this._cameraTarget();
+    if (cameraTarget && this.renderer &&
+        typeof this.renderer.updateChaseCamera === 'function') {
+      const camRs = makeRenderState(cameraTarget.prevTransform, cameraTarget.state, alpha);
+      this.renderer.updateChaseCamera(camRs, DT);
     }
 
-    // 3) HUD: the player's balloons + KILLS + a live standings panel of the field.
+    // 3) HUD: the player's balloons + score + a live standings panel of the field.
     if (this.hud) {
       const player = this._kartById.get('player');
       if (player) {
@@ -1455,11 +1726,10 @@ export class Battle {
           mode: 'battle',
           balloons: player.balloons,
           maxBalloons: START_BALLOONS,
-          score: player.score,                       // the player's KILL count (pops landed)
-          standings: this._buildStandings(),         // live mini-leaderboard (survivors first)
-          spectating: this._spectating,              // player eliminated -> SPECTATING badge
+          score: player.score,                       // the player's pop count (the win metric)
+          standings: this._buildStandings(),         // live mini-leaderboard (score-first)
           // Remaining match time -> HUD mm:ss clock (+ final-10s red pulse).
-          timeLeft: Math.max(0, TIME_LIMIT - this.clock),
+          timeLeft: Math.max(0, this.tuning.TIME_LIMIT - this.clock),
           miniTurboTier: player.state.miniTurboTier,
           // Held power-up for the top-center item slot (null when empty -> hidden).
           heldItem: this._heldItemFor('player'),
@@ -1469,54 +1739,10 @@ export class Battle {
   }
 
   /**
-   * FREE-FLY SPECTATOR camera (player is eliminated). Drive a flying eye around the
-   * arena with the normal controls — throttle/brake = forward/back along the look
-   * direction, steer = turn (yaw), drift/item = down/up — clamped to the arena bounds
-   * (with margin) and a sane height band, so the player can roam but can't leave the
-   * world. We set renderer.camera directly (the chase cam is bypassed while spectating).
-   * @param {number} dt
-   * @private
-   */
-  _updateSpectatorCamera(dt) {
-    const cam = this.renderer && this.renderer.camera;
-    if (!cam) return;
-    if (!this._specPos) { this._specPos = { x: 0, y: 14, z: 0 }; this._specYaw = 0; }
-
-    const inp = (this.input && typeof this.input.getState === 'function')
-      ? this.input.getState() : null;
-    const steer = inp ? (inp.steer || 0) : 0;
-    const fwd = inp ? ((inp.throttle || 0) - (inp.brake || 0)) : 0;
-    const up = inp ? ((inp.drift ? 1 : 0) - (inp.useItem ? 1 : 0)) : 0;
-
-    // Turn + move. Heading convention matches the karts: forward = (sin, cos).
-    this._specYaw += steer * 1.8 * dt;
-    const MOVE = 34; // m/s fly speed — brisk enough to follow the action
-    this._specPos.x += Math.sin(this._specYaw) * fwd * MOVE * dt;
-    this._specPos.z += Math.cos(this._specYaw) * fwd * MOVE * dt;
-    this._specPos.y += up * 18 * dt;
-
-    // Clamp inside the arena (with margin) and a comfortable height band.
-    const b = this.arena.bounds;
-    const m = 4;
-    this._specPos.x = Math.min(Math.max(this._specPos.x, b.minX + m), b.maxX - m);
-    this._specPos.z = Math.min(Math.max(this._specPos.z, b.minZ + m), b.maxZ - m);
-    this._specPos.y = Math.min(Math.max(this._specPos.y, 3), 40);
-
-    cam.up.set(0, 1, 0);
-    cam.position.set(this._specPos.x, this._specPos.y, this._specPos.z);
-    // Look forward + slightly down so the floor and karts stay framed.
-    cam.lookAt(
-      this._specPos.x + Math.sin(this._specYaw) * 16,
-      this._specPos.y - 5,
-      this._specPos.z + Math.cos(this._specYaw) * 16,
-    );
-  }
-
-  /**
    * Live standings for the HUD leaderboard: every kart sorted best-first by SCORE
    * (then balloons held), each with the fields the panel renders. Small (<= fieldSize)
    * and the HUD only rewrites the DOM when the data actually changes, so building this
-   * each frame is cheap.
+   * each frame is cheap. `down` marks a kart currently waiting out its respawn.
    * @returns {Array<{id:string,name:string,color:number,isPlayer:boolean,
    *                  score:number,balloons:number,down:boolean}>}
    * @private
@@ -1525,9 +1751,8 @@ export class Battle {
     return this.karts
       .slice()
       .sort((a, b) =>
-        (Number(b.alive) - Number(a.alive)) || // survivors first
-        (b.balloons - a.balloons) ||           // then most balloons
-        (b.score - a.score))                   // then most kills
+        (b.score - a.score) ||                 // most pops first (the win metric)
+        (b.balloons - a.balloons))             // then most balloons held
       .map((rec) => ({
         id: rec.id,
         name: this._displayName(rec),
@@ -1577,8 +1802,8 @@ export class Battle {
   // Helpers.
   // ========================================================================
   /**
-   * The alive subset of karts (still holding balloons). Built fresh each call —
-   * a tiny array of <= fieldSize entries, cheap at 60Hz.
+   * The alive subset of karts (everyone not currently downed/awaiting respawn).
+   * Built fresh each call — a tiny array of <= fieldSize entries, cheap at 60Hz.
    * @returns {Array}
    * @private
    */
@@ -1611,10 +1836,11 @@ export class Battle {
    * dispose contract the mode router (main.js) calls on teardown.
    */
   dispose() {
-    // Remove every kart visual.
+    // Free every kart's materials and detach it (dispose() removes the group too).
     for (let i = 0; i < this.karts.length; i++) {
-      const g = this.karts[i].kart.group;
-      if (g && g.parent) g.parent.remove(g);
+      const kart = this.karts[i].kart;
+      if (kart && typeof kart.dispose === 'function') kart.dispose();
+      else if (kart && kart.group && kart.group.parent) kart.group.parent.remove(kart.group);
     }
     this.karts = [];
     this._kartById.clear();
@@ -1646,17 +1872,15 @@ export class Battle {
       this._prevSceneFog = undefined;
     }
 
-    // Remove the super-horn shockwave ring.
-    if (this._shockwave && this._shockwave.mesh && this._shockwave.mesh.parent) {
-      this._shockwave.mesh.parent.remove(this._shockwave.mesh);
+    // Free the projectile + item-box GPU resources, then detach their groups
+    // (dispose() removes the group too; the guarded remove is a fallback).
+    if (this.projectiles) {
+      if (typeof this.projectiles.dispose === 'function') this.projectiles.dispose();
+      else if (this.projectiles.group && this.projectiles.group.parent) this.projectiles.group.parent.remove(this.projectiles.group);
     }
-
-    // Remove the projectile + item-box groups from the scene.
-    if (this.projectiles && this.projectiles.group && this.projectiles.group.parent) {
-      this.projectiles.group.parent.remove(this.projectiles.group);
-    }
-    if (this.itemBoxes && this.itemBoxes.group && this.itemBoxes.group.parent) {
-      this.itemBoxes.group.parent.remove(this.itemBoxes.group);
+    if (this.itemBoxes) {
+      if (typeof this.itemBoxes.dispose === 'function') this.itemBoxes.dispose();
+      else if (this.itemBoxes.group && this.itemBoxes.group.parent) this.itemBoxes.group.parent.remove(this.itemBoxes.group);
     }
     // (The end-of-battle results board is the shared ResultsScreen owned by the
     // mode router; main.js hides it on teardown / return to menu.)
@@ -1675,7 +1899,7 @@ export class Battle {
    * getKarts() into itemVfx.update). Exposing it lights up the SAME power-up VFX
    * the races get — per-kart hit bursts + dazed spin-stars on a pop, drift sparks,
    * boost-exhaust trails, and star auras — for the whole arena, for free. Returns
-   * the ALIVE subset so knocked-out karts stop emitting.
+   * the ALIVE subset so downed karts stop emitting until they respawn.
    * @returns {Array}
    */
   getKarts() {
@@ -1695,10 +1919,5 @@ export class Battle {
     // Full 3-slot strip for the HUD (resolves icons from ITEMS); null when empty.
     if (!this.itemSystem.hasItem(racerId)) return null;
     return { slots: this.itemSystem.getSlots(racerId) };
-  }
-
-  /** @returns {number} how many karts still hold balloons. */
-  getAliveCount() {
-    return this._aliveKarts().length;
   }
 }

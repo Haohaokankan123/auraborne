@@ -45,6 +45,25 @@ import { surfaceFrameAt } from '../../shared/trackData.js';
 // at construction and can live-apply a new tier via setQualityTier().
 import qualitySettings from './QualitySettings.js';
 
+// COUCH SPLIT-SCREEN LAYOUT: given N human players (1-4) and the canvas size in
+// CSS pixels, return N rects {x,y,w,h} with a TOP-LEFT origin that fully tile the
+// screen (no black gaps). renderSplitScreen flips y to WebGL's bottom-left origin.
+//   1 -> full screen        2 -> stacked halves (MK-style, full width each)
+//   3 -> two on top + one full-width strip below   4 -> quadrants
+export function couchLayout(n, W, H) {
+  const hw = W / 2, hh = H / 2;
+  if (n <= 1) return [{ x: 0, y: 0, w: W, h: H }];
+  if (n === 2) return [{ x: 0, y: 0, w: W, h: hh }, { x: 0, y: hh, w: W, h: hh }];
+  if (n === 3) return [
+    { x: 0, y: 0, w: hw, h: hh }, { x: hw, y: 0, w: hw, h: hh },
+    { x: 0, y: hh, w: W, h: hh },
+  ];
+  return [
+    { x: 0, y: 0, w: hw, h: hh }, { x: hw, y: 0, w: hw, h: hh },
+    { x: 0, y: hh, w: hw, h: hh }, { x: hw, y: hh, w: hw, h: hh },
+  ];
+}
+
 export class Renderer {
   constructor() {
     // Read the active quality budget ONCE up front. Antialias is locked in here
@@ -1135,16 +1154,37 @@ export class Renderer {
     const firstFrame = (this._camY === undefined || Number.isNaN(this._camY));
     if (firstFrame) {
       this._camY = state.y;
+      this._prevCamX = state.x; this._prevCamZ = state.z; this._prevCamYraw = state.y;
+      this._gradeSmooth = 0; // signed vertical grade (dy per horizontal metre), low-passed
     } else {
       this._camY += (state.y - this._camY) * (1 - Math.exp(-10 * dt));
     }
+
+    // DOWNHILL CAMERA CLEARANCE (fix: view punching through the track on a steep
+    // descent). The camera sits `distance` metres BEHIND the kart — and on a plunge
+    // the road BEHIND is HIGHER than the kart, so a camera planted at kart-height +
+    // `height` ends up BELOW that road and we look through the track we just came
+    // down. Estimate the centerline's vertical grade (Δy per horizontal metre),
+    // low-pass it so it doesn't jitter, and on a DESCENT raise the camera by how
+    // much higher the road sits `distance` behind us, so the lens always clears the
+    // slope at its back. Uphill needs no lift (the road behind is lower) — clamped
+    // to descents. Capped so a near-cliff can't fling the camera absurdly high.
+    const dxz = Math.hypot(state.x - this._prevCamX, state.z - this._prevCamZ);
+    if (dxz > 1e-4) {
+      const instGrade = (state.y - this._prevCamYraw) / dxz; // <0 going downhill
+      this._gradeSmooth += (instGrade - this._gradeSmooth) * (1 - Math.exp(-8 * dt));
+    }
+    this._prevCamX = state.x; this._prevCamZ = state.z; this._prevCamYraw = state.y;
+    // On a descent (_gradeSmooth < 0) the road `distance` behind is ~ -grade*distance
+    // higher; lift by that, eased by 0.9 and capped at 7m so framing stays sane.
+    const descentLift = Math.min(7, Math.max(0, -this._gradeSmooth) * distance * 0.9);
 
     // Desired camera position = kart position
     //   minus forward * distance  (so we sit BEHIND the kart)
     //   plus up * height          (so we look down on it slightly)
     // Vertical uses the PLANTED height (_camY), not raw state.y, to kill the bob.
     const desiredX = state.x - forwardX * distance;
-    const desiredY = this._camY + height;
+    const desiredY = this._camY + height + descentLift;
     const desiredZ = state.z - forwardZ * distance;
 
     // Smoothing (damping): instead of jumping straight to the desired spot,
@@ -1392,5 +1432,99 @@ export class Renderer {
     } else {
       this.composer.render();
     }
+  }
+
+  // ------------------------------------------------------------------
+  // setCouchMode(on) — COUCH MODE perf toggle.
+  // ------------------------------------------------------------------
+  // Split-screen draws the whole scene 2-4x per frame, so we drop the biggest
+  // per-frame cost while in couch mode: shadows OFF (which also no-ops the sun
+  // shadow-follow, which could only ever track one of N karts). We remember the
+  // pre-couch shadow setting and restore it on exit so other modes are unaffected.
+  // ponytail: shadows are re-enabled on exit; the next race rebuilds its track +
+  // kart materials fresh, so shadow sampling comes back without a manual needsUpdate.
+  setCouchMode(on) {
+    if (on) {
+      if (this._couchPrevShadows === undefined) {
+        this._couchPrevShadows = this.renderer.shadowMap.enabled;
+      }
+      this.renderer.shadowMap.enabled = false;
+    } else if (this._couchPrevShadows !== undefined) {
+      this.renderer.shadowMap.enabled = this._couchPrevShadows;
+      this._couchPrevShadows = undefined;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // renderSplitScreen(states, dt, trackId)   — COUCH MODE
+  // ------------------------------------------------------------------
+  // Draw the shared scene once per human player, each into its own viewport
+  // with its own chase camera. Reuses updateChaseCamera VERBATIM via a per-view
+  // "rig swap": each view keeps its chase state (planted height, follow-yaw,
+  // anti-grav up, downhill grade) on a rig; we swap that onto `this` around the
+  // existing updateChaseCamera call, then save the mutated state back. So the
+  // tuned camera math — including the downhill-clearance fix and the anti-grav
+  // roll — comes for free, per quadrant, with zero edits.
+  //
+  // Renders DIRECTLY (bypassing the bloom/grade composer): 2-4x scene draws are
+  // the cost lever, so couch mode runs a lighter tier (shadows off) and skips
+  // post. `states` = one kart STATE per human player, in join order.
+  renderSplitScreen(states, dt, trackId) {
+    const views = states || [];
+    const n = Math.min(4, views.length);
+    if (n === 0) return;
+    const size = this.renderer.getSize(this._couchSize || (this._couchSize = new THREE.Vector2()));
+    const W = size.x, H = size.y;
+    const rects = couchLayout(n, W, H);
+    if (!this._couchRigs) this._couchRigs = [];
+
+    // Save the main camera + chase state so this method has ZERO side effects on
+    // single-view modes (menu/other) that share this.camera / this._camY / etc.
+    const savedCamera = this.camera;
+    const s = {
+      camY: this._camY, followYaw: this._followYaw, agUp: this._agUp,
+      pX: this._prevCamX, pZ: this._prevCamZ, pY: this._prevCamYraw, grade: this._gradeSmooth,
+    };
+
+    this.renderer.setScissorTest(true);
+    for (let i = 0; i < n; i++) {
+      const state = views[i];
+      let rig = this._couchRigs[i];
+      if (!rig) {
+        const cam = new THREE.PerspectiveCamera(this._fovIdle, 1, this.camera.near, this.camera.far);
+        rig = this._couchRigs[i] = {
+          cam, camY: undefined, followYaw: undefined, agUp: null,
+          pX: undefined, pZ: undefined, pY: undefined, grade: 0,
+        };
+      }
+      const r = rects[i];
+      const yGL = H - r.y - r.h; // WebGL viewport origin is bottom-left
+      if (state) {
+        // rig state -> this, run the shared chase math, then this -> rig
+        this.camera = rig.cam;
+        this._camY = rig.camY; this._followYaw = rig.followYaw; this._agUp = rig.agUp;
+        this._prevCamX = rig.pX; this._prevCamZ = rig.pZ; this._prevCamYraw = rig.pY;
+        this._gradeSmooth = rig.grade;
+        this.updateChaseCamera(state, dt, trackId);
+        rig.camY = this._camY; rig.followYaw = this._followYaw; rig.agUp = this._agUp;
+        rig.pX = this._prevCamX; rig.pZ = this._prevCamZ; rig.pY = this._prevCamYraw;
+        rig.grade = this._gradeSmooth;
+      }
+      // autoClear (default true) clears each scissor rect before drawing, so the
+      // fully-tiled layout leaves no smear between cells.
+      this.renderer.setViewport(r.x, yGL, r.w, r.h);
+      this.renderer.setScissor(r.x, yGL, r.w, r.h);
+      rig.cam.aspect = r.w / r.h;
+      rig.cam.updateProjectionMatrix();
+      this.renderer.render(this.scene, rig.cam);
+    }
+
+    // Restore full-frame draw state so menus / other modes are unaffected.
+    this.renderer.setScissorTest(false);
+    this.renderer.setViewport(0, 0, W, H);
+    this.camera = savedCamera;
+    this._camY = s.camY; this._followYaw = s.followYaw; this._agUp = s.agUp;
+    this._prevCamX = s.pX; this._prevCamZ = s.pZ; this._prevCamYraw = s.pY;
+    this._gradeSmooth = s.grade;
   }
 }
