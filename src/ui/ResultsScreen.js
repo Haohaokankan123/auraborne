@@ -466,20 +466,15 @@ export class ResultsScreen {
     name.textContent = r.name;
     row.appendChild(name);
 
-    // KILLS (★ pops landed) + balloons-left, or a red OUT badge for an eliminated kart.
-    const kills = document.createElement('span');
-    kills.className = 'text-sm font-bold tabular-nums text-amber-300';
-    kills.textContent = '★' + (r.score || 0);
-    row.appendChild(kills);
+    // POPS (★ the win metric) + balloons held at the buzzer (0 = downed at time).
+    const pops = document.createElement('span');
+    pops.className = 'text-sm font-bold tabular-nums text-amber-300';
+    pops.textContent = '★' + (r.score || 0);
+    row.appendChild(pops);
 
     const tally = document.createElement('span');
-    if (r.eliminated || r.balloons <= 0) {
-      tally.className = 'w-14 text-right text-sm font-black tracking-wide text-rose-400';
-      tally.textContent = 'OUT';
-    } else {
-      tally.className = 'w-14 text-right text-base font-bold tabular-nums';
-      tally.textContent = '🎈×' + r.balloons;
-    }
+    tally.className = 'w-14 text-right text-base font-bold tabular-nums';
+    tally.textContent = '🎈×' + Math.max(0, r.balloons || 0);
     row.appendChild(tally);
 
     return row;
@@ -509,18 +504,16 @@ export class ResultsScreen {
     const list = Array.isArray(results) ? results : [];
     const me = list.find((r) => r.isPlayer);
     if (me) {
-      const kos = me.score || 0;
-      const survived = !(me.eliminated || me.balloons <= 0);
+      const pops = me.score || 0;
       this._summary.textContent =
-        (survived ? 'You placed ' + this._ordinal(me.place)
-                  : 'You were knocked out · ' + this._ordinal(me.place)) +
-        ' · ' + kos + ' KO' + (kos === 1 ? '' : 's');
+        'You placed ' + this._ordinal(me.place) +
+        ' · ' + pops + ' pop' + (pops === 1 ? '' : 's');
     } else {
       this._summary.textContent = 'Battle complete';
     }
 
     // Headline: a gold VICTORY! when the player tops the board, else BATTLE OVER.
-    const won = !!(me && me.place === 1 && !(me.eliminated || me.balloons <= 0));
+    const won = !!(me && me.place === 1);
     this._title.textContent = won ? 'VICTORY!' : 'BATTLE OVER';
     this._title.className = won ? this._titleClassVictory : this._titleClassBase;
 

@@ -241,6 +241,18 @@ export class RaceManager {
     // The player's M5 car selection (stats + color), or null for default behavior.
     this.playerSelection = opts.playerSelection || null;
 
+    // COUCH/TV (M6): optional roster of HUMAN players (phones on the couch): each
+    // { id, name, color, inputProvider } where inputProvider.getState() returns the
+    // exact Input.getState() shape. When present, the humans occupy the first grid
+    // slots (replacing the single 'player') and AI fill the rest. When absent, the
+    // field is the classic 1 player + N AI — the solo path is untouched.
+    this.humans = Array.isArray(opts.humans) && opts.humans.length ? opts.humans : null;
+
+    // TIME-TRIAL-ON-TV switches: strip items and pack contact so N humans race the
+    // clock exactly like solo Time Trial (same physics + laps, no interference).
+    this.noItems = !!opts.noItems;
+    this.noContact = !!opts.noContact;
+
     // DIFFICULTY: 'easy'|'medium'|'hard', default 'medium' so a skipped
     // DifficultySelect screen still yields a balanced field. It drives two things:
     // difficultyFactor (multiplies the AI's player-capped target top speed — <=1 on
@@ -266,7 +278,7 @@ export class RaceManager {
 
     this.totalLaps = opts.totalLaps != null ? opts.totalLaps : TOTAL_LAPS;
     const aiCount = opts.aiCount != null ? opts.aiCount : AI_COUNT;
-    this.fieldSize = aiCount + 1;
+    this.fieldSize = aiCount + (this.humans ? this.humans.length : 1);
 
     // --- Core race subsystems (built ONCE). ---------------------------------
     // Lap / checkpoint / standings tracker. Every racer registers below.
@@ -288,10 +300,11 @@ export class RaceManager {
     this.itemSystem = new ItemSystem({ rng: opts.rng });
 
     // World item boxes (adds its own .group to the scene in its constructor).
-    this.itemBoxes = new ItemBoxManager(track, scene);
+    // Skipped entirely in noItems (TV Time Trial) so no boxes appear on track.
+    this.itemBoxes = this.noItems ? null : new ItemBoxManager(track, scene);
 
     // Projectile pool (adds its own .group to the scene in its constructor).
-    this.projectiles = new ProjectileSystem(scene, track);
+    this.projectiles = this.noItems ? null : new ProjectileSystem(scene, track);
 
     // ONE physics wrapper reused for every kart. KartPhysics holds only scratch
     // vectors + a raycaster and is called strictly one kart at a time per tick,
@@ -319,11 +332,6 @@ export class RaceManager {
       this.lapSystem.addRacer(racer.id);
       this.scene.add(racer.kart.group);
     }
-
-    // Remember the player's last steer so render() can angle the front wheels to
-    // match the input the player is currently holding (render can't read Input
-    // itself without breaking the fixed-step contract — see main.js notes).
-    this._playerLastSteer = 0;
 
     // COMEBACK REWARD (R5-B): when the PLAYER falls off and respawns, _maybeRespawn
     // grants a strong catch-up item and stashes its display name here for render()
@@ -390,10 +398,15 @@ export class RaceManager {
    * @private
    */
   _buildField(aiCount) {
-    const total = aiCount + 1;
+    // COUCH/TV: the humans roster (phones) replaces the single 'player' in the
+    // first grid slots; AI fill the rest. Solo (no roster) = 1 player + aiCount AI.
+    const humans = this.humans;
+    const humanCount = humans ? humans.length : 1;
+    const total = aiCount + humanCount;
     for (let i = 0; i < total; i++) {
-      const isPlayer = i === 0;
-      const id = isPlayer ? 'player' : 'ai' + i;
+      const isHuman = i < humanCount;
+      const roster = isHuman && humans ? humans[i] : null;
+      const id = roster ? roster.id : (isHuman ? 'player' : 'ai' + i);
 
       // Grid pose: stagger each kart behind the start line.
       const pose = this._gridPose(i);
@@ -402,9 +415,11 @@ export class RaceManager {
       // (so stepKart scales their physics) and a body color. AI always use the
       // neutral default (no stats => identical to pre-M5). When no selection is
       // given the player also falls back to the default — fully backward-compatible.
+      // TV humans always use the neutral default (phones pick no stats) but carry
+      // their lobby color so each split-screen kart matches its phone's swatch.
       let state;
       let color = KART_COLORS[i % KART_COLORS.length];
-      if (isPlayer && this.playerSelection) {
+      if (isHuman && !roster && this.playerSelection) {
         const sel = this.playerSelection;
         // Spread the pose LAST so x/y/z/heading set the spawn; stats (if present)
         // seed the profile, undefined stats => neutral default in createKartState.
@@ -412,6 +427,7 @@ export class RaceManager {
         if (sel.color != null) color = sel.color;
       } else {
         state = createKartState(pose);
+        if (roster && roster.color != null) color = roster.color;
       }
 
       // A distinctly-colored kart mesh (wrap the palette if the field is bigger).
@@ -428,7 +444,7 @@ export class RaceManager {
       // between karts — the other half of the "stop driving in unison" fix.
       let ai = null;
       let isRival = false;
-      if (!isPlayer) {
+      if (!isHuman) {
         // SHARED slot builder: one of five PERSONALITY archetypes + a cc tuned to the
         // grid slot AND the chosen difficulty (HARD = fast/competitive field, EASY =
         // beatable). Identical to the server's fill for the same slot, so MP matches.
@@ -447,6 +463,12 @@ export class RaceManager {
         state,
         kart,
         ai,
+        // COUCH/TV: the phone's input source ({ getState() }) for this human, or
+        // null (the solo player reads this.input; AI compute their own).
+        inputProvider: roster ? roster.inputProvider || null : null,
+        // Grid slot, kept so a mid-race AI takeover (phone dropped) can build the
+        // same buildAISlot personality the server/solo field would use here.
+        _slotIndex: i,
         // Display fields for the end-of-race RESULTS board. color is the kart's
         // body tint (player's M5 choice or the palette swatch); name is a friendly
         // label ("YOU" for the player, "CPU N" for each AI) since AI have no chosen
@@ -454,7 +476,9 @@ export class RaceManager {
         color,
         // The designated RIVAL takes the fixed nemesis name (so it reads as a
         // recurring foe across the cup, not an anonymous "CPU N").
-        name: isPlayer ? 'YOU' : (isRival ? RIVAL_NAME : 'CPU ' + i),
+        name: roster
+          ? (roster.name || 'P' + (i + 1))
+          : (isHuman ? 'YOU' : (isRival ? RIVAL_NAME : 'CPU ' + i)),
         // RIVAL flag exposed on the record so the HUD minimap / nameplate can tag the
         // nemesis and the results board / cup head-to-head can find it. Read-only
         // metadata — nothing in the deterministic sim reads it.
@@ -561,8 +585,13 @@ export class RaceManager {
     // Standings drive both AI rubber-banding and item-bracket rolls. Compute
     // them ONCE up front from last tick's scores; cheap (sort of 13 entries).
     const standings = this.lapSystem.getStandings();
-    const playerProgress = this._racerById.get('player');
-    const playerScore = playerProgress ? playerProgress.progressScore : 0;
+    // Rubber-band reference: the LEADING human's progress. Solo this is exactly
+    // the one player's score; on TV the AI pace off whichever phone is furthest.
+    let playerScore = 0;
+    for (let i = 0; i < this.racers.length; i++) {
+      const r = this.racers[i];
+      if (!r.ai && r.progressScore > playerScore) playerScore = r.progressScore;
+    }
 
     // Fill the shared AI context (reused object — just refresh the fields).
     this._aiContext.dt = dt;
@@ -585,7 +614,6 @@ export class RaceManager {
       let input;
       if (this._locked || this.raceOver) {
         input = NEUTRAL_INPUT;
-        if (!racer.ai) this._playerLastSteer = 0;
         racer.lastSteer = 0;
       } else if (racer.ai) {
         this._aiContext.myProgressScore = racer.progressScore;
@@ -596,9 +624,13 @@ export class RaceManager {
         this._aiContext.selfHeldItem = this.itemSystem.getHeld(racer.id);
         input = racer.ai.computeInput(racer.state, this._aiContext);
         racer.lastSteer = input.steer;
+      } else if (racer.inputProvider) {
+        // COUCH/TV: this human's phone input, relayed through the server. Same
+        // shape as Input.getState(), so stepKart treats it identically.
+        input = racer.inputProvider.getState();
+        racer.lastSteer = input.steer;
       } else {
         input = this.input.getState();
-        this._playerLastSteer = input.steer;
         racer.lastSteer = input.steer;
       }
       // Stash the input so the item step below can read useItem without polling
@@ -787,13 +819,13 @@ export class RaceManager {
     // SKIP while LOCKED (countdown) or OVER: a bump pass on the stationary,
     // tightly packed grid would shove karts apart and ooze them off their staggered
     // slots before GO — so the grid sits perfectly still until release() frees it.
-    if (!this._locked && !this.raceOver) {
+    if (!this._locked && !this.raceOver && !this.noContact) {
       this._resolvePackContact(dt);
     }
 
     // --- 2. Item boxes: detect pickups, award an item if the racer's hands
     //        are empty. (One pickup entry per box grabbed this frame.) ---------
-    const pickups = this.itemBoxes.update(this.karts, dt);
+    const pickups = this.itemBoxes ? this.itemBoxes.update(this.karts, dt) : [];
     if (pickups.length > 0) {
       // Re-read standings AFTER physics so the item bracket reflects this tick's
       // positions (front-runners get weak items, back-runners get strong ones).
@@ -828,7 +860,7 @@ export class RaceManager {
     }
 
     // --- 4. Projectiles: move, home, bounce, and collide vs every kart. ------
-    this.projectiles.update(dt, this.karts);
+    if (this.projectiles) this.projectiles.update(dt, this.karts);
 
     // --- 5. ITEM STATE MIRROR (cross-stream CONTRACT). -----------------------
     // For EVERY kart, publish its currently-held ORBIT-ABLE item onto its
@@ -871,23 +903,39 @@ export class RaceManager {
       }
     }
 
-    // --- 6. FINISH: end the race the tick the PLAYER crosses the final line. --
-    // LapSystem flips progress.finished true at totalLaps. On that rising edge we
-    // re-lock the field (so every kart coasts to a stop via the neutral input),
-    // flag raceOver for main.js to show the results board, and snapshot the final
-    // standings ONCE so getResults() is stable while karts roll out.
+    // --- 6. FINISH: end the race once EVERY human has crossed the final line. --
+    // Solo this is exactly the old "the tick the PLAYER finishes" edge. On TV,
+    // waiting on all phones would soft-lock if one player wanders off, so once the
+    // FIRST human finishes a grace clock runs; when it expires the race ends and
+    // the stragglers rank by progress (classic kart-game behavior). On the edge we
+    // re-lock the field (karts coast to a stop via the neutral input), flag
+    // raceOver for main.js, and snapshot the standings ONCE so getResults() is
+    // stable while karts roll out.
     if (!this.raceOver) {
-      const pprog = this.lapSystem.getProgress('player');
-      if (pprog && pprog.finished) {
+      let humansTotal = 0;
+      let humansDone = 0;
+      for (let i = 0; i < this.racers.length; i++) {
+        const r = this.racers[i];
+        if (r.ai) continue;
+        humansTotal++;
+        const prog = this.lapSystem.getProgress(r.id);
+        if (prog && prog.finished) humansDone++;
+      }
+      if (humansDone > 0 && humansDone < humansTotal) {
+        this._finishGrace = (this._finishGrace || 0) + dt;
+      }
+      const graceUp = (this._finishGrace || 0) >= 30;
+      if (humansTotal > 0 && (humansDone === humansTotal || graceUp)) {
         this.raceOver = true;
         this._locked = true; // freeze control (neutral input for all karts)
         this._results = this._computeResults();
         // PLACEMENT PAYOUT: bank the player's finish-place coins into the spendable
-        // wallet. This is its own pool — separate from the coins grabbed on track
-        // (main.js banks those from coinsEarned) and from the cup bonus (GrandPrixCup
-        // banks that at championship completion). Fires exactly once, on this edge.
-        const me = this._results.find((r) => r.isPlayer);
-        if (me) addCoins(coinsForPlace(me.place));
+        // wallet. SOLO ONLY — TV humans have no local wallet, and the shared screen
+        // must never write the Mac owner's playerStats for a phone's finish.
+        if (!this.humans) {
+          const me = this._results.find((r) => r.isPlayer);
+          if (me) addCoins(coinsForPlace(me.place));
+        }
       }
     }
   }
@@ -1158,7 +1206,11 @@ export class RaceManager {
       const dx = sx - feat.x;
       const dz = sz - feat.z;
       if (dx * dx + dz * dz <= r * r) {
-        applySpin(racer.state); // default spin duration; no-op if invincible
+        // RISING EDGE only: applySpin takes the max of the new duration and whatever's
+        // left, so re-firing every tick a stationary racer sits in the hazard kept
+        // resetting the timer to full — it never left the puddle, so it spun forever.
+        // Only (re-)trigger once the previous spin has fully expired.
+        if (racer.state.spinTimer <= 0) applySpin(racer.state);
         break; // one hazard hit per tick is plenty
       }
     }
@@ -1464,7 +1516,7 @@ export class RaceManager {
       // is over: a kart rolling off an edge during the finish-line rollout must NOT
       // grant a useless item or flash "COMEBACK!" over the results screen. The
       // reposition above still runs (a kart always recovers); only the perk is gated.
-      if (!racer.ai && !this._locked && !this.raceOver) {
+      if (!racer.ai && !this._locked && !this.raceOver && !this.noItems) {
         // Pool of strong CATCH-UP items (3 boosts / rapid boosts / invincible-fast /
         // autopilot rocket) — the "3 strong comeback items" spirit in the one-id+count
         // held slot. Pick with the SEEDED rng (not Math.random) so the draw stays
@@ -1508,9 +1560,10 @@ export class RaceManager {
     //    live input steer captured in update().
     for (let i = 0; i < this.racers.length; i++) {
       const racer = this.racers[i];
-      const steer = racer.ai ? racer.lastSteer : this._playerLastSteer;
+      // lastSteer is captured in update() for every record (player, AI, phone), so
+      // render never has to poll an input source (fixed-step contract preserved).
       const rs = makeRenderState(racer.prevTransform, racer.state, alpha);
-      racer.kart.syncFromState(rs, DT, steer);
+      racer.kart.syncFromState(rs, DT, racer.lastSteer);
     }
 
     // 2. Chase camera follows the PLAYER, from the SAME interpolated transform the
@@ -1744,6 +1797,53 @@ export class RaceManager {
    */
   getKarts() {
     return this.racers;
+  }
+
+  /**
+   * COUCH/TV: one render-interpolated view per roster human, in join order, for
+   * the split-screen renderer + overlay. A kart whose phone dropped (AI takeover)
+   * KEEPS its view — the quadrant just watches the AI drive. Empty when solo.
+   *
+   * @param {number} alpha  render interpolation factor in [0, 1).
+   * @returns {Array<{id:string, name:string, color:number|string, state:object}>}
+   */
+  getHumanViews(alpha) {
+    if (!this.humans) return [];
+    const out = [];
+    for (let i = 0; i < this.humans.length; i++) {
+      const racer = this._racerById.get(this.humans[i].id);
+      if (!racer) continue;
+      out.push({
+        id: racer.id,
+        name: racer.name,
+        color: racer.color,
+        state: makeRenderState(racer.prevTransform, racer.state, alpha),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * COUCH/TV: a phone dropped mid-race — hand its kart to an AI brain built for
+   * the SAME grid slot (identical personality/pace the solo field would have
+   * there), so the race carries on seamlessly. Idempotent; returns whether a
+   * takeover actually happened.
+   *
+   * @param {string} id  the human racer id (server playerId).
+   * @returns {boolean}
+   */
+  replaceWithAI(id) {
+    const racer = this._racerById.get(id);
+    if (!racer || racer.ai) return false;
+    const { cc, profile } = buildAISlot(racer._slotIndex, this.difficulty);
+    racer.ai = new AIRacer({
+      racingLine: this.racingLine,
+      cc,
+      profile,
+      seed: racer._slotIndex,
+    });
+    racer.inputProvider = null;
+    return true;
   }
 
   /**

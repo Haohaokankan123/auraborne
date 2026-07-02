@@ -49,7 +49,15 @@ const CUP_CC_MULT = { easy: 1.0, medium: 1.4, hard: 1.8 };
 const TIER_ORDER = ['easy', 'medium', 'hard'];
 
 export class GrandPrixCup {
-  constructor() {
+  /**
+   * @param {Object}  [opts]
+   * @param {boolean} [opts.persistRewards=true]  false for COUCH/TV cups: the
+   *   points/standings machinery is id-keyed and works for N humans as-is, but
+   *   the completion rewards (coin bonus, trophy, tier unlock) belong to the
+   *   Mac owner's playerStats and must never be written for a phone's finish.
+   */
+  constructor({ persistRewards = true } = {}) {
+    this.persistRewards = persistRewards;
     // The track running order + a 0-based index into it (the current race).
     this.trackOrder = TRACK_ORDER;
     this.raceIndex = 0;
@@ -143,6 +151,10 @@ export class GrandPrixCup {
   _finalize() {
     if (this._finalized) return;
     this._finalized = true;
+
+    // COUCH/TV cup: no local player — skip every playerStats write (coins,
+    // trophy, tier unlock). The champion still comes from getStandings().
+    if (!this.persistRewards) return;
 
     const standings = this.getStandings();
     if (!standings.length) return;

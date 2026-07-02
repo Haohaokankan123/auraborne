@@ -19,7 +19,9 @@ import { io } from 'socket.io-client';
 
 // The server messages we re-broadcast to local listeners. Listed explicitly so
 // a typo in onEvent('snapsho') fails loudly instead of silently never firing.
-const SERVER_EVENTS = ['joined', 'lobby', 'raceStart', 'snapshot', 'raceEnd', 'playerLeft'];
+// 'couchInput' is COUCH/TV only: the server relays each phone's raw input to the
+// TV/screen socket, which feeds it into the local sim via CouchInputHub.
+const SERVER_EVENTS = ['joined', 'lobby', 'raceStart', 'snapshot', 'raceEnd', 'playerLeft', 'couchInput'];
 
 export class SocketClient {
   /**

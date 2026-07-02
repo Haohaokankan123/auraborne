@@ -598,7 +598,7 @@ export class Room {
 
       // RESPAWN safety net (no walls): off-road too long OR fallen below the track
       // surface -> snap back onto the road at the last checkpoint. Lap untouched.
-      this._maybeRespawn(kart, surf, dt);
+      this._maybeRespawn(kart, surf, dt, events);
     }
 
     // --- 2. Item boxes: detect pickups, roll an item if hands are empty ---
@@ -1014,6 +1014,12 @@ export class Room {
         pos: 0, // filled below from standings (1-based race position)
         item: held ? held.id : '',
       };
+      // FULL 3-SLOT inventory, streamed ONLY when the kart is actually holding
+      // something (empty hands = zero extra bytes). Lets the phone + TV show all
+      // three power-up slots, not just the first. Each entry is {id,count} or null.
+      if (this.itemSystem.hasItem(k.id)) {
+        karts[i].slots = this.itemSystem.getSlots(k.id);
+      }
       // ANTI-GRAV: stream the 4 surface-relative fields ONLY while in a section, so a
       // normal lap (the common case, 13 karts) costs zero extra bytes. agS needs round5
       // (round3 ≈ 3.9 m granularity on a ~3870 m lap would jitter the derived
@@ -1259,7 +1265,11 @@ export class Room {
       const r = (feat.params && feat.params.radius) || 4;
       const dx = sx - feat.x, dz = sz - feat.z;
       if (dx * dx + dz * dz <= r * r) {
-        applySpin(kart.state); // default spin; no-op if invincible
+        // RISING EDGE only: applySpin takes the max of the new duration and whatever's
+        // left, so re-firing every tick a stationary kart sits in the hazard kept
+        // resetting the timer back to full — the kart never left the puddle, so it
+        // spun forever. Only (re-)trigger once the previous spin has fully expired.
+        if (kart.state.spinTimer <= 0) applySpin(kart.state);
         break;
       }
     }
@@ -1275,7 +1285,7 @@ export class Room {
    * @param {number} dt
    * @private
    */
-  _maybeRespawn(kart, surf, dt) {
+  _maybeRespawn(kart, surf, dt, events) {
     if (surf.onRoad) kart._offroadTime = 0;
     else kart._offroadTime += dt;
 
@@ -1307,6 +1317,17 @@ export class Room {
     kart.state.lastS = undefined; // re-acquire section after respawn teleport
     kart.state.agSection = -1;    // a respawn drops out of any anti-grav section
     kart._offroadTime = 0;
+
+    // CATCH-UP: getting sent back (fell off the edge / stuck off-road) hands a HUMAN
+    // a comeback power-up, like Mario Kart — so "you get a power-up after dying".
+    // Only when a slot is free (a full hand keeps what it holds); emits a pickup so
+    // the phone + TV item HUD update immediately.
+    if (!kart.isAI && this.itemSystem.hasFreeSlot(kart.id)) {
+      const REWARDS = ['mushroom', 'star', 'tripleMushroom', 'bulletBill'];
+      const reward = REWARDS[Math.floor(Math.random() * REWARDS.length)];
+      this.itemSystem.giveItem(kart.id, reward);
+      if (events) events.push({ kind: 'pickup', id: kart.id, item: reward });
+    }
   }
 }
 

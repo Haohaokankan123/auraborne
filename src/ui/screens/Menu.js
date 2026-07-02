@@ -163,6 +163,8 @@ export class Menu {
     buttonColumn.appendChild(shopBtn);
     this.element.appendChild(buttonColumn);
     // Keep the button list (in DOM order) so show() can stagger them in.
+    // NB: "PLAY ON TV" is no longer a standalone mode here — every mode offers a
+    // HERE/TV choice on the PlayTargetSelect screen right after it's picked.
     this._buttons = [grandPrixBtn, timeTrialBtn, battleBtn, multiBtn, shopBtn];
 
     // --- Footer note ------------------------------------------------------

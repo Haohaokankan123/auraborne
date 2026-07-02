@@ -8,6 +8,7 @@
     "dev": "vite",
     "dev:full": "concurrently -k -n vite,server -c cyan,magenta \"vite\" \"node server/index.js\"",
     "server": "node server/index.js",
+    "couch": "bash scripts/couch.sh",
     "build": "vite build",
     "preview": "vite preview",
     "start": "node server/index.js"
@@ -19,6 +20,7 @@
     "express": "^5.2.1",
     "gsap": "^3.15.0",
     "howler": "^2.2.4",
+    "qrcode": "^1.5.4",
     "socket.io": "^4.8.3",
     "socket.io-client": "^4.8.3",
     "three": "^0.184.0"

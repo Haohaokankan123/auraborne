@@ -292,19 +292,6 @@ export class HUD {
       'absolute top-3 left-1/2 -translate-x-1/2 flex gap-2 text-3xl drop-shadow hidden';
     this.element.appendChild(this.balloonsElement);
 
-    // Alive count: "{alive} ALIVE" pinned top-right, mirroring the position slot.
-    this.aliveElement = document.createElement('div');
-    this.aliveElement.id = 'hud-alive';
-    this.aliveElement.className = 'absolute top-3 right-4 text-right drop-shadow hidden';
-    this.aliveElement.innerHTML =
-      '<span class="text-3xl font-bold">1</span>' +
-      '<span class="text-lg font-semibold opacity-80"> ALIVE</span>';
-    // Cache the count span + the label span so update() can refresh the number and
-    // swap the standing ("ALIVE" while the player is in -> "SPECTATING" once out).
-    this.aliveCountElement = this.aliveElement.querySelector('span:nth-child(1)');
-    this.aliveLabelElement = this.aliveElement.querySelector('span:nth-child(2)');
-    this.element.appendChild(this.aliveElement);
-
     // --- BATTLE live standings (score leaderboard) -----------------------
     // A compact top-right panel listing every kart sorted by SCORE (pops landed),
     // with a colour chip, name, ★score and 🎈balloons. The player's row is
@@ -1114,7 +1101,6 @@ export class HUD {
     // Not battle: make sure the battle-only elements are hidden and the
     // race-only elements are visible (in case we switched modes mid-session).
     this.balloonsElement.classList.add('hidden');
-    this.aliveElement.classList.add('hidden');
     this.battleStandingsElement.classList.add('hidden');
     this.battleClockElement.classList.add('hidden');
     this.lapElement.classList.remove('hidden');
@@ -1581,10 +1567,13 @@ export class HUD {
   }
 
   // _updateBattle(info) shows the BATTLE-mode HUD: a row of balloon icons for
-  // the player's remaining balloons, and how many players are still ALIVE.
+  // the player's remaining balloons, their pop score, the match clock, and the
+  // live standings leaderboard.
   //   info.balloons      -> balloons the player has left (default 3)
   //   info.maxBalloons   -> total balloon slots to show (default 3)
-  //   info.alive         -> number of players still in the match (default 1)
+  //   info.score         -> the player's pop count (the win metric)
+  //   info.standings     -> score-sorted field for the top-right leaderboard
+  //   info.timeLeft      -> remaining match seconds for the mm:ss clock
   // We render filled balloon icons for remaining balloons and faded ones for
   // lost balloons so the count reads at a glance.
   _updateBattle(info) {
@@ -1598,10 +1587,8 @@ export class HUD {
     // feedback, and each self-hides when idle — no clutter when unused.)
     this.trickElement.classList.add('hidden');
 
-    // Show the battle elements (balloon row + standings panel). The old bare "N ALIVE"
-    // count is replaced by the richer standings leaderboard, so keep it hidden.
+    // Show the battle elements (balloon row + standings panel).
     this.balloonsElement.classList.remove('hidden');
-    this.aliveElement.classList.add('hidden');
 
     // Match clock: mm:ss remaining, pulsing red in the final 10 seconds.
     this._updateBattleClock(info.timeLeft);
@@ -1611,25 +1598,21 @@ export class HUD {
       ? Math.min(Math.max(0, Math.round(info.balloons)), max)
       : max;
 
-    // Top-center row. While ALIVE: a balloon per remaining one (dimmed for lost ones)
-    // + the player's KILL count (★). Once ELIMINATED: a clear SPECTATING badge instead,
-    // since the player has no balloons and is now flying the free spectator cam.
+    // Top-center row: a balloon per remaining one (dimmed for lost ones) + the
+    // player's POP score (★). While downed all balloons read dimmed; the respawn
+    // banner (from Battle) covers the beat, so no extra badge is needed here.
     let html = '';
-    if (info.spectating) {
-      html = '<span class="text-lg font-black tracking-widest text-rose-300">👁 SPECTATING</span>';
-    } else {
-      for (let i = 0; i < max; i++) {
-        const lost = i >= balloons;
-        html += '<span class="' + (lost ? 'opacity-30 scale-90' : '') + '">🎈</span>';
-      }
-      if (info.score != null) {
-        html += '<span class="ml-3 text-amber-300 font-black tabular-nums">★' +
-          Math.max(0, Math.round(info.score)) + '</span>';
-      }
+    for (let i = 0; i < max; i++) {
+      const lost = i >= balloons;
+      html += '<span class="' + (lost ? 'opacity-30 scale-90' : '') + '">🎈</span>';
+    }
+    if (info.score != null) {
+      html += '<span class="ml-3 text-amber-300 font-black tabular-nums">★' +
+        Math.max(0, Math.round(info.score)) + '</span>';
     }
     this.balloonsElement.innerHTML = html;
 
-    // Live standings leaderboard (top-right): survivors first, eliminated dimmed.
+    // Live standings leaderboard (top-right): score-first, downed karts dimmed.
     this._updateBattleStandings(info.standings);
   }
 
@@ -1666,7 +1649,7 @@ export class HUD {
         '<span class="inline-block w-2.5 h-2.5 rounded-full ring-1 ring-white/40 shrink-0" ' +
         'style="background:' + this._battleColorCss(s.color) + '"></span>';
       const tally = s.down
-        ? '<span class="text-[10px] font-black text-rose-400 tracking-wide">OUT</span>'
+        ? '<span class="text-[10px] font-black text-rose-400 tracking-wide">···</span>'
         : '<span class="text-[10px] opacity-70 tabular-nums">🎈' + s.balloons + '</span>';
       html +=
         '<div class="flex items-center gap-1.5 px-1.5 py-0.5 rounded-md text-xs ' + rowCls + dim + '">' +

@@ -20,6 +20,8 @@
 // wiring.
 
 import http from 'node:http';
+import https from 'node:https';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
@@ -80,15 +82,31 @@ if (IS_PROD) {
 // --------------------------------------------------------------------------
 // Socket.IO needs the raw http.Server (not the Express app) so it can handle the
 // WebSocket upgrade on the same port.
-const httpServer = http.createServer(app);
+// COUCH MODE / LAN HTTPS: if SSL_KEY + SSL_CERT point at a certificate (e.g. an
+// mkcert cert for the Mac's LAN IP), serve over HTTPS so phones get a "secure
+// context" — REQUIRED for the tilt controls (DeviceOrientation is HTTPS-only).
+// Without those env vars we serve plain HTTP exactly as before (dev unchanged).
+// Socket.IO rides the same server, so it auto-upgrades to wss under HTTPS.
+let httpServer;
+let isHttps = false;
+const sslKey = process.env.SSL_KEY;
+const sslCert = process.env.SSL_CERT;
+if (sslKey && sslCert && fs.existsSync(sslKey) && fs.existsSync(sslCert)) {
+  httpServer = https.createServer(
+    { key: fs.readFileSync(sslKey), cert: fs.readFileSync(sslCert) },
+    app,
+  );
+  isHttps = true;
+} else {
+  httpServer = http.createServer(app);
+}
 
 const io = new SocketIOServer(httpServer, {
   cors: {
-    // In dev the browser is on :5173 and we are on :3001 — different origins,
-    // so the websocket handshake is cross-origin and must be explicitly allowed.
-    // In prod the client is served from this same origin, so CORS is moot, but
-    // allowing the dev origin is harmless.
-    origin: [DEV_ORIGIN],
+    // Same-origin in prod (page + socket both served here), so CORS never fires —
+    // reflect the request origin as belt-and-suspenders for the LAN https origin.
+    // In dev the browser is on :5173 (cross-origin), so allow that explicitly.
+    origin: IS_PROD ? true : [DEV_ORIGIN],
     methods: ['GET', 'POST'],
   },
 });
@@ -106,7 +124,8 @@ const game = new GameServer(io);
 httpServer.listen(PORT, () => {
   // One clear line so the operator knows where the server is and what mode it is in.
   const mode = IS_PROD ? 'production (serving ./dist)' : 'development (client via Vite :5173)';
-  console.log(`[server] kart server listening on http://localhost:${PORT}  —  ${mode}`);
+  const proto = isHttps ? 'https' : 'http';
+  console.log(`[server] kart server listening on ${proto}://localhost:${PORT}  —  ${mode}${isHttps ? '  —  HTTPS (tilt-ready)' : ''}`);
 });
 
 // Export for tests / programmatic embedding (not required by `node server/index.js`).
