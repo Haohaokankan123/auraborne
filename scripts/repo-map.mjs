@@ -14,6 +14,21 @@ const REC = '\x1e'; // record separator (between commits)
 const sh = (cmd) => { try { return execSync(cmd, { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 }); } catch { return ''; } };
 const shJSON = (cmd) => { const o = sh(cmd).trim(); if (!o) return null; try { return JSON.parse(o); } catch { return null; } };
 
+// first ref that actually exists (for resolving PR head/base to origin/<ref> or <ref>)
+const firstRef = (...cands) => cands.find((c) => c && sh(`git rev-parse --verify --quiet ${c}^{commit}`).trim()) || '';
+const mergeBase = (a, b) => sh(`git merge-base ${a} ${b}`).trim() || EMPTY_TREE;
+
+// per-file diff between two refs (or base→working-tree when tip==='' with a cwd). Shared by commits/branches/worktrees/PRs.
+function diffFiles(base, tip, cwd) {
+  const C = cwd ? `-C "${cwd}" ` : '';
+  const numstat = sh(`git ${C}diff ${base} ${tip} --numstat`).split('\n').filter(Boolean);
+  const byFile = parsePatchByFile(sh(`git ${C}diff ${base} ${tip}`));
+  return numstat.map((line) => {
+    const [add, del, file] = line.split('\t');
+    return { file, add: add === '-' ? 0 : parseInt(add, 10), del: del === '-' ? 0 : parseInt(del, 10), binary: add === '-', patch: byFile[file] || '' };
+  });
+}
+
 // ---- worktrees -------------------------------------------------------------
 function worktrees() {
   const out = sh('git worktree list --porcelain');
@@ -29,6 +44,8 @@ function worktrees() {
     w.name = w.path === root ? 'main checkout' : w.path.split('/').pop();
     w.rel = w.path === root ? w.path : w.path.replace(root + '/', '');
     w.subject = sh(`git log -1 --format=%s ${w.head}`).trim();
+    // files that differ from main — committed on the branch PLUS uncommitted working changes (tip='' → base vs working tree)
+    w.files = diffFiles(mergeBase(MAIN, w.head), '', w.path);
   }
   return list;
 }
@@ -37,13 +54,26 @@ function worktrees() {
 function branches() {
   const fmt = ['%(refname:short)', '%(objectname:short)', '%(subject)', '%(committerdate:iso8601)', '%(upstream:track)'].join(SEP);
   const rows = sh(`git for-each-ref --sort=-committerdate --format='${fmt}' refs/heads`).split('\n').filter(Boolean);
-  return rows.map((r) => { const [name, sha, subject, date, track] = r.split(SEP); return { name, sha, subject, date, track: track || '' }; });
+  const mainName = MAIN.replace(/^origin\//, '');
+  return rows.map((r) => {
+    const [name, sha, subject, date, track] = r.split(SEP);
+    // files this branch changed relative to main (merge-base..branch); the main branch itself has none
+    const files = name === mainName ? [] : diffFiles(mergeBase(MAIN, sha), sha);
+    return { name, sha, subject, date, track: track || '', files };
+  });
 }
 
 // ---- PRs (via gh) ----------------------------------------------------------
 function prs() {
   const data = shJSON('gh pr list --state all --limit 100 --json number,title,state,headRefName,baseRefName,isDraft,createdAt,mergedAt,url,additions,deletions,changedFiles,author');
-  return (data || []).sort((a, b) => b.number - a.number);
+  const list = (data || []).sort((a, b) => b.number - a.number);
+  for (const p of list) {
+    // resolve head/base to real refs (prefer remote), then diff base…head
+    const head = firstRef(`origin/${p.headRefName}`, p.headRefName);
+    const base = firstRef(`origin/${p.baseRefName}`, p.baseRefName, MAIN);
+    p.files = head && base ? diffFiles(mergeBase(base, head), head) : [];
+  }
+  return list;
 }
 
 // ---- commits + per-file patches -------------------------------------------
@@ -71,19 +101,7 @@ function commits() {
     const [full, short, author, date, subject, parents] = rec.split(SEP);
     const parentList = (parents || '').trim().split(/\s+/).filter(Boolean);
     const base = parentList[0] || EMPTY_TREE;
-    const numstat = sh(`git diff ${base} ${full} --numstat`).split('\n').filter(Boolean);
-    const patchRaw = sh(`git diff ${base} ${full}`);
-    const byFile = parsePatchByFile(patchRaw);
-    const files = numstat.map((line) => {
-      const [add, del, file] = line.split('\t');
-      return {
-        file,
-        add: add === '-' ? 0 : parseInt(add, 10),
-        del: del === '-' ? 0 : parseInt(del, 10),
-        binary: add === '-',
-        patch: byFile[file] || '',
-      };
-    });
+    const files = diffFiles(base, full);
     return {
       full, short, author, date, subject,
       isMerge: parentList.length > 1,
@@ -97,6 +115,7 @@ function commits() {
 }
 
 // ---- assemble --------------------------------------------------------------
+const MAIN = firstRef('origin/main', 'main', 'origin/master', 'master') || 'HEAD';
 const data = {
   repo: sh('git rev-parse --show-toplevel').trim().split('/').pop() || 'repo',
   generated: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC',
@@ -180,6 +199,16 @@ background:var(--panel);border:2px solid var(--accent);box-shadow:0 0 0 4px #0b0
 .commit.open .caret{transform:rotate(90deg)}
 .files{display:none;margin:10px 0 6px;border-top:1px solid var(--panel2);padding-top:8px}
 .commit.open .files{display:block}
+/* expandable cards (worktrees / branches / PRs) reuse the same file list + sidebar */
+.card.exp{padding:0}
+.card-head{display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:16px 18px}
+.card-head:hover{background:#141c2e}
+.card-head>.caret{color:var(--dim);transition:transform .15s;display:inline-block;margin-top:1px;font-size:15px}
+.card.exp.open .card-head>.caret{transform:rotate(90deg)}
+.card-head .fcount{align-self:center;white-space:nowrap}
+.card.exp .files{margin:0;padding:2px 18px 14px;border-top:1px solid var(--panel2)}
+.card.exp.open .files{display:block}
+.no-files{padding:8px 6px;color:var(--dim);font-size:12.5px}
 .frow{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;padding:5px 6px;border-radius:8px;cursor:pointer}
 .frow:hover{background:var(--panel2)}
 .frow .fn{font-family:ui-monospace,monospace;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -248,15 +277,43 @@ document.body.append(overlay, sidebar);
 overlay.onclick = closeSidebar;
 sidebar.querySelector('.sb-close').onclick = closeSidebar;
 document.addEventListener('keydown',(e)=>{if(e.key==='Escape')closeSidebar();});
-function openFile(f, commit){
+function openFile(f, srcShort, srcSubject){
   sidebar.querySelector('.fname').textContent = f.file;
   const st = f.del===0? 'added' : f.add===0? 'removed' : 'modified';
-  sidebar.querySelector('.sub2').innerHTML = st+' · <span style="color:var(--add)">+'+f.add+'</span> <span style="color:var(--del)">−'+f.del+'</span> · in '+commit.short+' — '+esc(commit.subject);
+  sidebar.querySelector('.sub2').innerHTML = st+' · <span style="color:var(--add)">+'+f.add+'</span> <span style="color:var(--del)">−'+f.del+'</span> · '+esc(srcShort)+' — '+esc(srcSubject||'');
   sidebar.querySelector('.sb-body').innerHTML = renderDiff(f.patch);
   sidebar.querySelector('.sb-body').scrollTop = 0;
   overlay.classList.add('show'); sidebar.classList.add('show');
 }
 function closeSidebar(){ overlay.classList.remove('show'); sidebar.classList.remove('show'); }
+
+// a .files container of clickable file rows → sidebar. Shared by commits + expandable cards.
+function filesBlock(files, srcShort, srcSubject){
+  const box = el('<div class="files"></div>');
+  if(!files || !files.length){ box.append(el('<div class="no-files">No file changes vs main.</div>')); return box; }
+  const max = Math.max(1, ...files.map(x=>x.add+x.del));
+  for(const f of files){
+    const st = f.del===0? 'A' : f.add===0? 'D' : 'M';
+    const w = 90*(f.add+f.del)/max, gw = (f.add+f.del)? w*f.add/(f.add+f.del) : 0, rw = w-gw;
+    const row = el('<div class="frow"><div class="fn"><span class="st '+st+'">'+st+'</span>'+esc(f.file)+'</div>'+
+      '<div class="stat"><span class="nums"><span class="a">+'+f.add+'</span> <span class="d">−'+f.del+'</span></span>'+
+      '<span class="track"><span class="g" style="width:'+gw+'px"></span><span class="r" style="width:'+rw+'px"></span></span></div></div>');
+    row.onclick=(e)=>{e.stopPropagation();openFile(f,srcShort,srcSubject);};
+    box.append(row);
+  }
+  return box;
+}
+// a card whose header expands to its changed-file list. innerHTML = the header content.
+function expandCard(innerHTML, files, srcShort, srcSubject){
+  const n = files ? files.length : 0;
+  const card = el('<div class="card exp"></div>');
+  const head = el('<div class="card-head"><span class="caret">›</span><div style="flex:1;min-width:0">'+innerHTML+
+    '</div><span class="pill fcount">'+n+' file'+(n===1?'':'s')+'</span></div>');
+  head.querySelectorAll('a').forEach(a=>a.addEventListener('click',(e)=>e.stopPropagation()));
+  head.onclick=()=>card.classList.toggle('open');
+  card.append(head, filesBlock(files, srcShort, srcSubject));
+  return card;
+}
 
 const app = document.getElementById('app');
 const nav = el('<div class="nav"></div>');
@@ -282,7 +339,7 @@ const VIEWS = {
   overview(){
     const wrap = el('<div></div>');
     wrap.append(el('<h1>'+D.repo+' — Repo Map</h1>'));
-    wrap.append(el('<p class="sub">A living map of every worktree, branch, pull request and commit. Click any file in a commit to see its exact diff.</p>'));
+    wrap.append(el('<p class="sub">A living map of every worktree, branch, pull request and commit. Expand any of them and click a file to see its exact diff.</p>'));
     wrap.append(el('<div class="totrow">'+
       card(D.worktrees.length,'worktrees')+card(D.branches.length,'branches')+
       card(openPRs+' / '+mergedPRs,'PRs open / merged')+card(D.commits.length,'commits')+
@@ -301,35 +358,37 @@ const VIEWS = {
   },
   worktrees(){
     const wrap = el('<div></div>');
-    wrap.append(el('<h1>Worktrees</h1><p class="sub">Isolated working copies — each on its own branch, sharing one git history.</p>'));
+    wrap.append(el('<h1>Worktrees</h1><p class="sub">Isolated working copies — each on its own branch, sharing one git history. Files shown are everything different from main (committed + uncommitted).</p>'));
     for(const w of D.worktrees){
       const isCur = w.branch===D.currentBranch;
-      wrap.append(el('<div class="card"><div class="top">'+
+      const inner = '<div class="top">'+
         '<b>'+esc(w.name)+'</b>'+(isCur?'<span class="badge cur">current</span>':'')+
         '<span class="badge merge">'+esc(w.branch||'?')+'</span><span class="sha">'+w.head+'</span></div>'+
         '<div class="muted" style="margin:6px 0 4px">'+esc(w.subject||'')+'</div>'+
-        '<div class="wt-path">'+esc(w.path)+'</div></div>'));
+        '<div class="wt-path">'+esc(w.path)+'</div>';
+      wrap.append(expandCard(inner, w.files, w.head, 'worktree · '+w.name));
     }
     return wrap;
   },
   branches(){
     const wrap = el('<div></div>');
-    wrap.append(el('<h1>Branches</h1><p class="sub">Local branches, newest activity first.</p>'));
+    wrap.append(el('<h1>Branches</h1><p class="sub">Local branches, newest activity first. Files shown are what the branch changed relative to main.</p>'));
     for(const b of D.branches){
       const cur = b.name===D.currentBranch;
-      wrap.append(el('<div class="card"><div class="top">'+
+      const inner = '<div class="top">'+
         '<b class="mono">'+esc(b.name)+'</b>'+(cur?'<span class="badge cur">current</span>':'')+
         '<span class="sha">'+b.sha+'</span>'+(b.track?'<span class="pill">'+esc(b.track.replace(/[\[\]]/g,''))+'</span>':'')+
         '<span class="muted" style="margin-left:auto;font-size:12px">'+esc(b.date.slice(0,16))+'</span></div>'+
-        '<div class="muted" style="margin-top:6px">'+esc(b.subject)+'</div></div>'));
+        '<div class="muted" style="margin-top:6px">'+esc(b.subject)+'</div>';
+      wrap.append(expandCard(inner, b.files, b.sha, 'branch · '+b.name));
     }
     return wrap;
   },
   prs(){
     const wrap = el('<div></div>');
-    wrap.append(el('<h1>Pull Requests</h1><p class="sub">'+openPRs+' open · '+mergedPRs+' merged.</p>'));
+    wrap.append(el('<h1>Pull Requests</h1><p class="sub">'+openPRs+' open · '+mergedPRs+' merged. Files shown are the PR diff (base…head).</p>'));
     if(!D.prs.length) wrap.append(el('<p class="muted">No pull requests found (is gh authenticated?).</p>'));
-    for(const p of D.prs) wrap.append(prCard(p, true));
+    for(const p of D.prs) wrap.append(prCard(p));
     return wrap;
   },
   commits(){
@@ -347,11 +406,12 @@ function card(n,l,cls){ return '<div class="tot"><div class="n '+(cls||'')+'">'+
 function prCard(p){
   const st = p.state.toLowerCase();
   const badge = p.isDraft&&p.state==='OPEN' ? '<span class="badge draft">draft</span>' : '<span class="badge '+st+'">'+st+'</span>';
-  return el('<div class="card"><div class="top">'+badge+
+  const inner = '<div class="top">'+badge+
     '<b>#'+p.number+'</b> <span>'+esc(p.title)+'</span></div>'+
     '<div class="muted" style="margin-top:7px;font-size:12.5px"><span class="mono">'+esc(p.headRefName)+'</span> → <span class="mono">'+esc(p.baseRefName)+'</span>'+
     ' · <span class="plusminus"><span class="a">+'+(p.additions||0)+'</span><span class="d">−'+(p.deletions||0)+'</span></span>'+
-    ' · '+(p.changedFiles||0)+' files · <a class="link" href="'+p.url+'" target="_blank">view on GitHub ↗</a></div></div>');
+    ' · <a class="link" href="'+p.url+'" target="_blank">view on GitHub ↗</a></div>';
+  return expandCard(inner, p.files, '#'+p.number, 'PR #'+p.number+' · '+p.headRefName+' → '+p.baseRefName);
 }
 
 function commitNode(c){
@@ -361,20 +421,7 @@ function commitNode(c){
     '<span class="subj">'+esc(c.subject)+'</span>'+(c.isMerge?'<span class="badge merge">merge</span>':'')+refBadges+'</div>');
   const meta = el('<div class="cmeta"><span class="sha">'+c.short+'</span> · '+esc(c.author)+' · '+esc(c.date)+
     ' · <span class="plusminus"><span class="a">+'+c.add+'</span><span class="d">−'+c.del+'</span></span> · '+c.files.length+' files</div>');
-  const files = el('<div class="files"></div>');
-  const max = Math.max(1, ...c.files.map(x=>x.add+x.del));
-  for(const f of c.files){
-    const st = f.del===0? 'A' : f.add===0? 'D' : 'M';
-    const w = 90*(f.add+f.del)/max;
-    const gw = (f.add+f.del)? w*f.add/(f.add+f.del) : 0;
-    const rw = w-gw;
-    const row = el('<div class="frow"><div class="fn"><span class="st '+st+'">'+st+'</span>'+esc(f.file)+'</div>'+
-      '<div class="stat"><span class="nums"><span class="a">+'+f.add+'</span> <span class="d">−'+f.del+'</span></span>'+
-      '<span class="track"><span class="g" style="width:'+gw+'px"></span><span class="r" style="width:'+rw+'px"></span></span></div></div>');
-    row.onclick=(e)=>{e.stopPropagation();openFile(f,c);};
-    files.append(row);
-  }
-  node.append(head, meta, files);
+  node.append(head, meta, filesBlock(c.files, c.short, c.subject));
   head.onclick=()=>node.classList.toggle('open');
   return node;
 }
