@@ -105,7 +105,7 @@ function commits() {
     return {
       full, short, author, date, subject,
       isMerge: parentList.length > 1,
-      parents: parentList.map((p) => p.slice(0, 7)),
+      parents: parentList,
       refs: sh(`git for-each-ref --points-at ${full} --format='%(refname:short)'`).split('\n').filter(Boolean),
       add: files.reduce((s, f) => s + f.add, 0),
       del: files.reduce((s, f) => s + f.del, 0),
@@ -185,12 +185,13 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:1.3px;color:var(--dim)
 a.link{color:var(--accent);text-decoration:none}a.link:hover{text-decoration:underline}
 .muted{color:var(--dim)}
 .wt-path{font-family:ui-monospace,monospace;font-size:12px;color:var(--dim);word-break:break-all}
-.timeline{position:relative;padding-left:24px}
-.timeline:before{content:"";position:absolute;left:5px;top:6px;bottom:6px;width:2px;background:linear-gradient(var(--accent),var(--accent2))}
-.commit{position:relative;margin-bottom:10px}
-.commit>.dot{position:absolute;left:-24px;top:18px;width:12px;height:12px;border-radius:50%;
-background:var(--panel);border:2px solid var(--accent);box-shadow:0 0 0 4px #0b0f17}
-.commit.merge>.dot{border-color:var(--dim)}
+/* commit DAG graph: SVG lane gutter behind the rows */
+.graphwrap{position:relative}
+.graph{position:absolute;top:0;left:0;pointer-events:none;overflow:visible}
+.grows{position:relative}
+.commit{position:relative;margin-bottom:12px}
+.commit .chead{min-height:24px}
+.badge.wt{background:#0f2a1c;color:#5bd68a;border:1px solid #1f5a38}
 .commit .chead{cursor:pointer;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .commit .chead:hover .subj{color:var(--accent)}
 .commit .subj{font-weight:600;font-size:14.5px}
@@ -247,6 +248,59 @@ const esc = (s)=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;
 const el = (h)=>{const t=document.createElement('template');t.innerHTML=h.trim();return t.content.firstChild;};
 const totAdd = D.commits.reduce((s,c)=>s+c.add,0), totDel = D.commits.reduce((s,c)=>s+c.del,0);
 const openPRs = D.prs.filter(p=>p.state==='OPEN').length, mergedPRs = D.prs.filter(p=>p.state==='MERGED').length;
+const worktreeBranches = new Set(D.worktrees.map(w=>w.branch).filter(Boolean));
+
+// ---- commit-DAG graph -----------------------------------------------------
+const LANE_COLORS = ['#58a6ff','#bc8cff','#3fb950','#f0b429','#f85149','#39c5cf','#ff9e64','#d2a8ff','#7ee787','#ff7b72'];
+const laneColor = (col)=>LANE_COLORS[col % LANE_COLORS.length];
+let _redrawGraph = null; // set by the commits() view; called on expand/collapse + resize to keep nodes aligned
+
+// Assign every commit a column (lane) and collect parent→child edges — the classic "railway" layout.
+function computeLanes(commits){
+  const known = new Set(commits.map(c=>c.full));
+  const idx = new Map(commits.map((c,i)=>[c.full,i]));
+  const cols = new Map();
+  const lanes = [];                       // lanes[i] = the commit hash that lane i currently flows toward, or null
+  const firstFree = ()=>{ const i=lanes.indexOf(null); if(i>=0) return i; lanes.push(null); return lanes.length-1; };
+  const edges = [];
+  for(const c of commits){
+    let myCol = lanes.indexOf(c.full);
+    if(myCol<0) myCol = firstFree();      // a branch tip nothing pointed at yet
+    lanes[myCol] = null;                  // this commit has arrived; free its lane
+    cols.set(c.full, myCol);
+    const parents = c.parents.filter(p=>known.has(p));
+    parents.forEach((p,i)=>{
+      let pc = lanes.indexOf(p);
+      if(pc<0){ pc = (i===0) ? myCol : firstFree(); lanes[pc] = p; } // 1st parent stays in lane; extra parents open a lane
+      edges.push({from:c.full, to:p});
+    });
+  }
+  const maxCol = cols.size ? Math.max(...cols.values()) : 0;
+  return { cols, idx, edges, maxCol };
+}
+
+function drawGraph(svg, wrap, rowEls, commits, lay){
+  const PAD=16, COLW=20, R=5;
+  const wrapTop = wrap.getBoundingClientRect().top;
+  const Y = rowEls.map(row=>{ const a=row.querySelector('.chead'); const rc=a.getBoundingClientRect(); return rc.top - wrapTop + rc.height/2; });
+  const X = (col)=>PAD + col*COLW;
+  const width = PAD*2 + lay.maxCol*COLW, height = wrap.scrollHeight;
+  svg.setAttribute('width', width); svg.setAttribute('height', height); svg.setAttribute('viewBox', '0 0 '+width+' '+height);
+  wrap.querySelector('.grows').style.paddingLeft = width+'px';
+  let s='';
+  for(const e of lay.edges){
+    const cr=lay.idx.get(e.from), pr=lay.idx.get(e.to), cCol=lay.cols.get(e.from), pCol=lay.cols.get(e.to);
+    const x1=X(cCol), y1=Y[cr], x2=X(pCol), y2=Y[pr], color=laneColor(pCol);
+    let d;
+    if(cCol===pCol){ d='M'+x1+' '+y1+'V'+y2; }
+    else { const by=Math.min(y1+34,y2); d='M'+x1+' '+y1+'C'+x1+' '+((y1+by)/2)+' '+x2+' '+((y1+by)/2)+' '+x2+' '+by+'V'+y2; }
+    s+='<path d="'+d+'" fill="none" stroke="'+color+'" stroke-width="2"/>';
+  }
+  commits.forEach((c,r)=>{ const col=lay.cols.get(c.full), x=X(col), y=Y[r], color=laneColor(col);
+    s+='<circle cx="'+x+'" cy="'+y+'" r="'+R+'" fill="'+(c.isMerge?'#0b0f17':color)+'" stroke="'+color+'" stroke-width="2.5"/>';
+  });
+  svg.innerHTML=s;
+}
 
 const SECTIONS = [
   {id:'overview', label:'Overview', icon:'◉', count:null},
@@ -393,10 +447,17 @@ const VIEWS = {
   },
   commits(){
     const wrap = el('<div></div>');
-    wrap.append(el('<h1>Commits</h1><p class="sub">Every commit across all branches. Click a commit to expand its files, then a file to see the diff.</p>'));
-    const tl = el('<div class="timeline"></div>');
-    for(const c of D.commits) tl.append(commitNode(c));
-    wrap.append(tl);
+    wrap.append(el('<h1>Commits</h1><p class="sub">Real branch graph across every ref — lanes branch out and merge back in. 🌳 marks a worktree head. Click a commit to expand its files.</p>'));
+    const lay = computeLanes(D.commits);
+    const gw = el('<div class="graphwrap"></div>');
+    const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+    svg.setAttribute('class','graph');
+    const grows = el('<div class="grows"></div>');
+    const rowEls = D.commits.map(c=>{ const n = commitNode(c); grows.append(n); return n; });
+    gw.append(svg, grows);
+    wrap.append(gw);
+    _redrawGraph = ()=>drawGraph(svg, gw, rowEls, D.commits, lay);
+    requestAnimationFrame(_redrawGraph);
     return wrap;
   },
 };
@@ -415,16 +476,22 @@ function prCard(p){
 }
 
 function commitNode(c){
-  const node = el('<div class="commit'+(c.isMerge?' merge':'')+'"><div class="dot"></div></div>');
-  const refBadges = c.refs.map(r=>'<span class="badge '+(r===D.currentBranch?'cur':'merge')+'">'+esc(r)+'</span>').join('');
+  const node = el('<div class="commit'+(c.isMerge?' merge':'')+'"></div>');
+  const refBadges = c.refs.map(r=>{
+    const wt = worktreeBranches.has(r);
+    const cls = r===D.currentBranch ? 'cur' : (wt ? 'wt' : 'merge');
+    return '<span class="badge '+cls+'">'+(wt?'🌳 ':'')+esc(r)+'</span>';
+  }).join('');
   const head = el('<div class="chead"><span class="caret">›</span>'+
     '<span class="subj">'+esc(c.subject)+'</span>'+(c.isMerge?'<span class="badge merge">merge</span>':'')+refBadges+'</div>');
   const meta = el('<div class="cmeta"><span class="sha">'+c.short+'</span> · '+esc(c.author)+' · '+esc(c.date)+
     ' · <span class="plusminus"><span class="a">+'+c.add+'</span><span class="d">−'+c.del+'</span></span> · '+c.files.length+' files</div>');
   node.append(head, meta, filesBlock(c.files, c.short, c.subject));
-  head.onclick=()=>node.classList.toggle('open');
+  head.onclick=()=>{ node.classList.toggle('open'); if(_redrawGraph) requestAnimationFrame(_redrawGraph); };
   return node;
 }
+
+let _rz; window.addEventListener('resize', ()=>{ clearTimeout(_rz); _rz=setTimeout(()=>{ if(location.hash==='#commits' && _redrawGraph) _redrawGraph(); }, 120); });
 
 const start = (location.hash||'#overview').slice(1);
 show(start && VIEWS[start] ? start : 'overview');
