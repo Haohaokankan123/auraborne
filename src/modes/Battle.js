@@ -86,7 +86,7 @@ const POP_CREDIT_RADIUS = 3.0;   // m  how near a snapshotted projectile must be
 const PLAYER_SPEED_CAP = 34;     // m/s player cruise (bumped from 31; still below the bot floor so bots pressure you)
 // Bot cruise caps span a personality range, ALL above the player: even the slowest bot
 // out-cruises you, and aces hit the 44 race top. cap = MIN + aggression*(MAX-MIN). Boosts exempt.
-const BOT_SPEED_CAP_MIN = 36;    // m/s slowest bot — already faster than the player
+const BOT_SPEED_CAP_MIN = 40;    // m/s slowest bot — tight, brutal spread (40-44); every bot clearly out-cruises the player (PR #1)
 const BOT_SPEED_CAP_MAX = 44;    // m/s ace cruise (the full race top speed)
 const STUCK_MOVE = 0.04;         // m   per-tick (60Hz) actual displacement below this = barely progressing (~2.4 m/s)
 const STUCK_TIME = 0.6;          // s   barely-moving this long => the bot is pinned (wall/corner) and triggers an escape
@@ -329,8 +329,8 @@ export class Battle {
       // HARDER FIELD: no rookies anymore — every bot is aggressive and sharp, aces near max.
       // With opts.botPlayer the "player" record is a bot too, so it rolls the same spread.
       const botDriven = !isHuman || (isPlayer && this.botPlayer);
-      const aggression = botDriven ? 0.82 + Math.random() * 0.18 : 0;  // 0.82 .. 1.0 (all aggressive)
-      const skill = botDriven ? 0.85 + Math.random() * 0.15 : 0;       // 0.85 .. 1.0 (all crisp/quick)
+      const aggression = botDriven ? 0.88 + Math.random() * 0.12 : 0;  // 0.88 .. 1.0 (uniformly brutal — PR #1 floor)
+      const skill = botDriven ? 0.90 + Math.random() * 0.10 : 0;       // 0.90 .. 1.0 (all razor-sharp — PR #1 floor)
 
       // Visual kart, colored per player selection / lobby swatch / bot palette.
       const color = roster && roster.color != null
