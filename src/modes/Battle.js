@@ -49,7 +49,7 @@ const TIME_LIMIT = 90;           // s  match length; most balloons POPPED (score
 // A TIGHTER arena (was the Arena default 120) packs the field together so karts cross paths
 // constantly — the density is what drives the pop count up into the brutal 20-40-per-bot range.
 const ARENA_SIZE = 64;           // m  full edge length of the battle floor
-const HIT_POP_SPIN = 1.0;        // s  brief spin applied as the balloon-pop reaction
+const HIT_POP_SPIN = 0.30;       // s  brief spin applied as the balloon-pop reaction. ALSO the global per-victim immunity window (a spinning kart can't be re-popped), so this is the dominant throttle on field-wide pop rate — kept short so the brawl stays high-volume.
 const SPIN_EDGE_EPS = 0.05;      // s  spinTimer above this counts as "freshly hit"
 
 // SCORE RACE WITH RESPAWNS (per Charles): the classic Mario-Kart balloon battle.
@@ -58,16 +58,16 @@ const SPIN_EDGE_EPS = 0.05;      // s  spinTimer above this counts as "freshly h
 // TIME_LIMIT and `score` = how many balloons YOU popped on others (your kill count)
 // is the win metric — most pops wins. With respawns feeding a constant stream of
 // targets, brutally aggressive bots each rack up ~20-40 pops over the 90s match.
-const RESPAWN_DELAY = 1.2;       // s  popped kart stays down this long, then re-inflates
-const RESPAWN_INVULN = 1.3;      // s  brief invincibility on respawn so you aren't instantly re-popped
+const RESPAWN_DELAY = 0.6;       // s  popped kart stays down this long, then re-inflates (short = back in the brawl fast = more total pops)
+const RESPAWN_INVULN = 0.7;      // s  brief invincibility on respawn so you aren't instantly re-popped
                                  //     (reuses starTimer => the classic respawn glow + applySpin no-op)
 
 // RAM-to-pop tuning (client-only bumper-car combat; never touches shared physics).
 // Tuned for a HIGH-VOLUME score brawl: rams connect readily so aggression constantly
 // pays off and the pop count climbs into the 20-40-per-bot range Charles wants.
-const RAM_CONTACT = 5.0;         // m   center distance counting as a body-to-body hit (forgiving so "drive into them" connects)
-const RAM_APPROACH = 2.5;        // m/s how hard the attacker must be driving TOWARD the other to pop it (lower = more crashes land)
-const RAM_COOLDOWN = 0.35;        // s   per-victim guard so one crash pops one balloon (short = fast follow-up pops)
+const RAM_CONTACT = 6.5;         // m   center distance counting as a body-to-body hit. Deliberately > the ~5.2m min turn radius so a bot circling a rival is already inside pop range (kills the orbit-at-arm's-length stall) and far more brawl contacts convert.
+const RAM_APPROACH = 1.5;        // m/s how hard the attacker must be driving TOWARD the other to pop it (lower = more glancing crashes land)
+const RAM_COOLDOWN = 0.25;        // s   per-victim guard so one crash pops one balloon (short = fast follow-up pops)
 const POP_CREDIT_RADIUS = 3.0;   // m   how near a player projectile must be to credit a pop
 
 // PACE + ANTI-STUCK tuning (client-only; battle is single-player vs bots, so no parity concern).
@@ -297,8 +297,8 @@ export class Battle {
       //     adds an organic, hard-to-read wobble to their pathing; skill sharpens
       //     steering + reactions. Randomised per battle so no two matches feel the same.
       // HARDER FIELD: no rookies anymore — every bot is aggressive and sharp, aces near max.
-      const aggression = isPlayer ? 0 : 0.82 + Math.random() * 0.18;  // 0.82 .. 1.0 (all aggressive)
-      const skill = isPlayer ? 0 : 0.85 + Math.random() * 0.15;       // 0.85 .. 1.0 (all crisp/quick)
+      const aggression = isPlayer ? 0 : 0.88 + Math.random() * 0.12;  // 0.88 .. 1.0 (uniformly brutal)
+      const skill = isPlayer ? 0 : 0.90 + Math.random() * 0.10;       // 0.90 .. 1.0 (all razor-sharp)
 
       // Visual kart, colored per player selection / bot palette.
       const color = isPlayer
@@ -355,7 +355,7 @@ export class Battle {
         // constant pressure but the rest BRAWL EACH OTHER aggressively — that spread is
         // what lets every bot rack up its own 20-40 pops (not just whoever ganks the
         // player). The opportunistic majority always hunts the nearest/weakest rival.
-        aiHunter: !isPlayer && Math.random() < 0.25,
+        aiHunter: !isPlayer && Math.random() < 0.4,
         aiSpeedCap: BOT_SPEED_CAP_MIN + aggression * (BOT_SPEED_CAP_MAX - BOT_SPEED_CAP_MIN),
         aiWeavePhase: Math.random() * Math.PI * 2,       // desync each bot's wobble
         aiWeaveFreq: 1.1 + Math.random() * 1.4,          // rad/s of the steering wobble
@@ -934,8 +934,9 @@ export class Battle {
 
     if (rec.isPlayer) {
       // Player popped out -> a quick, punchy "respawning" cue + rose wash. They are back
-      // in the fight in ~1.2s (no spectator dead-end now — it's a score race).
-      if (canBanner) this.hud.showRewardBanner('💥 POPPED — respawning…', 'alert', 1.0);
+      // in the fight in ~0.6s (no spectator dead-end now — it's a score race), so the
+      // banner is short enough to clear about when control returns.
+      if (canBanner) this.hud.showRewardBanner('💥 POPPED — respawning…', 'alert', 0.7);
       if (typeof this.hud._pulseFlash === 'function') {
         this.hud._pulseFlash('rgba(244, 63, 94, 0.55)', 0.6, 0.7); // rose-500 wash
       }
@@ -953,8 +954,8 @@ export class Battle {
 
   /**
    * RESPAWN engine: tick every downed kart's timer; when it elapses, re-inflate the
-   * kart with a fresh set of balloons at the safest spawn point (the one farthest from
-   * the live field) and grant a brief RESPAWN_INVULN window. Called once per update()
+   * kart with a fresh set of balloons in the central brawl zone and grant a brief
+   * RESPAWN_INVULN window. Called once per update()
    * before the combat list is built, so a re-inflated kart fights again the same tick.
    * @param {number} dt
    * @private
@@ -969,10 +970,11 @@ export class Battle {
   }
 
   /**
-   * Re-inflate a downed kart: restore all START_BALLOONS (show the meshes), drop it at
-   * the safest open spawn, zero its motion/spin, and grant RESPAWN_INVULN (via starTimer
-   * so applySpin no-ops and the kart wears the classic respawn glow). Resets the anti-
-   * stuck + ram bookkeeping so it drives clean immediately.
+   * Re-inflate a downed kart: restore all START_BALLOONS (show the meshes), drop it in
+   * the central brawl zone, clear its spin, and grant RESPAWN_INVULN (via starTimer so
+   * applySpin no-ops and the kart wears the classic respawn glow). Bots re-enter MOVING
+   * (anti-pin kick); the player re-enters stationary under their own control. Resets the
+   * anti-stuck + ram bookkeeping so it drives clean immediately.
    * @param {object} rec
    * @private
    */
@@ -995,11 +997,19 @@ export class Battle {
     // respawns don't stack on the same spot (deterministic, no rng needed).
     const sp = spawns[(rec.knockouts || 0) % spawns.length];
     const s = rec.state;
-    s.x = cx + (sp.x - cx) * 0.4;
+    s.x = cx + (sp.x - cx) * 0.55;
     s.y = sp.y;
-    s.z = cz + (sp.z - cz) * 0.4;
+    s.z = cz + (sp.z - cz) * 0.55;
     s.heading = Math.atan2(cx - s.x, cz - s.z); // face the center / the melee
-    s.speed = 0;
+    // BOTS respawn ALREADY MOVING toward the melee (not from a standstill). A motionless
+    // bot in the dense center got pinned at speed 0 and focus-farmed: it was popped again
+    // the instant invuln dropped, spun out (which bleeds speed to 0), knocked out, and
+    // respawned motionless again — racking up deaths but never moving enough to score.
+    // Entering at speed means it's already clearing the kill zone when invuln ends.
+    // The PLAYER respawns STATIONARY and takes over with their own input — an uncommanded
+    // 22 m/s lurch every respawn would feel like a loss of control; they have the invuln
+    // window + immediate steering to escape the pile themselves, so they don't need it.
+    s.speed = rec.isPlayer ? 0 : 22;
     s.spinTimer = 0;
     s.starTimer = Math.max(s.starTimer, RESPAWN_INVULN); // brief invuln + respawn glow
     if ('boostTimer' in s) s.boostTimer = 0;
@@ -1217,7 +1227,7 @@ export class Battle {
       // WOUNDED (one ram finishes a 1-balloon kart = a fast point) with only a MILD player
       // bias, so pops spread across the whole field and each bot racks up its own tally.
       const score = Math.sqrt(d2)
-        - (o.isPlayer ? 18 : 0)                           // mild human bias (still always pressured)
+        - (o.isPlayer ? 26 : 0)                           // human bias — even opportunistic bots lean toward ganking you
         - (START_BALLOONS - o.balloons) * 14;             // strongly prefer finishing the wounded (fast pops)
       if (score < bestScore) { bestScore = score; target = o; bestD2 = d2; }
     }
