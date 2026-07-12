@@ -32,7 +32,7 @@ const SPIN_SPEED = 1.8;        // rad/s  how fast the boxes idly rotate
 const PICKUP_RADIUS = 2.6;     // m  grabs the box — matches RING_RADIUS (the glowing ground
                                //     marker you drive through); also box half-extent 1.1m +
                                //     kart half-width ~0.9m + a small grab margin.
-const RESPAWN_TIME = 3.0;      // s  how long a grabbed box stays hidden
+const RESPAWN_TIME = 3.0;      // s  how long a grabbed box stays hidden (default; opts.respawnTime overrides)
 // --- "read me as a drive-through pickup" cues (all cosmetic) -----------------
 const BOB_AMPLITUDE = 0.28;    // m  how far the box gently floats up/down
 const BOB_SPEED = 2.2;         // rad/s  speed of the up/down bob
@@ -53,17 +53,20 @@ const BOXES_PER_ROW = 4;       // boxes spread across the road width in each row
  * detects pickups.
  *
  * Public surface:
- *   - new ItemBoxManager(track, scene)  builds the boxes and adds .group to scene.
+ *   - new ItemBoxManager(track, scene, opts)  builds the boxes and adds .group to scene.
  *   - .group                            THREE.Group holding every box mesh.
  *   - .update(karts, dt) -> pickups[]   spins boxes, returns [{ racerId }] for
  *                                        each box grabbed THIS frame.
  *
  * @param {object} track  the Track instance (uses checkpoints, roadWidth, isOnRoad).
  * @param {THREE.Scene} scene  the scene to add the box group to.
+ * @param {{respawnTime?:number}} [opts]  per-manager overrides — battle passes a
+ *        faster box respawn; races omit it and keep the 3s default.
  */
 export class ItemBoxManager {
-  constructor(track, scene) {
+  constructor(track, scene, opts = {}) {
     this.track = track;
+    this._respawnTime = opts.respawnTime != null ? opts.respawnTime : RESPAWN_TIME;
 
     // Per-tier env-reflection scale applied to the PBR box materials below (1.0 ==
     // today's look on MED; 0 on LOW = no reflections; glossier on HIGH/ULTRA).
@@ -437,7 +440,7 @@ export class ItemBoxManager {
           box.mesh.visible = false;
           box.mesh.scale.setScalar(1);
           this._restoreSharedMaterials(box);
-          box.respawn = RESPAWN_TIME;
+          box.respawn = this._respawnTime;
         }
         continue; // a popping box can't be grabbed again
       }
@@ -524,5 +527,33 @@ export class ItemBoxManager {
   _restoreSharedMaterials(box) {
     box.mesh.material = this._material;
     box.core.material = this._coreMaterial;
+  }
+
+  /**
+   * Free every geometry/material/texture this manager built (its box/panel/halo/
+   * core/ring assets, the sigil CanvasTexture, and any per-box pop-shell clones)
+   * and detach its group. A fresh ItemBoxManager is constructed each race, so all
+   * of these are owned here and were previously orphaned in GPU memory on every
+   * race restart. Walk the group (dedup via a Set) like Track.dispose().
+   */
+  dispose() {
+    const seen = new Set();
+    const disposeMat = (m) => {
+      if (!m || seen.has(m)) return;
+      seen.add(m);
+      for (const k of ['map', 'emissiveMap', 'alphaMap', 'normalMap']) {
+        const tex = m[k];
+        if (tex && typeof tex.dispose === 'function') tex.dispose();
+      }
+      if (typeof m.dispose === 'function') m.dispose();
+    };
+    this.group.traverse((o) => {
+      if (o.geometry && typeof o.geometry.dispose === 'function') o.geometry.dispose();
+      const mat = o.material;
+      if (Array.isArray(mat)) mat.forEach(disposeMat);
+      else disposeMat(mat);
+    });
+    if (this._sigilTexture && typeof this._sigilTexture.dispose === 'function') this._sigilTexture.dispose();
+    if (this.group.parent) this.group.parent.remove(this.group);
   }
 }

@@ -466,13 +466,11 @@ export class ResultsScreen {
     name.textContent = r.name;
     row.appendChild(name);
 
-    // ★ pops landed (the score-race headline) + balloons held at the buzzer. In the
-    // respawn score race nobody is permanently eliminated, so there's no "OUT" badge —
-    // a kart caught mid-respawn simply shows 🎈×0 (it would re-inflate a beat later).
-    const kills = document.createElement('span');
-    kills.className = 'text-sm font-bold tabular-nums text-amber-300';
-    kills.textContent = '★' + (r.score || 0);
-    row.appendChild(kills);
+    // POPS (★ the win metric) + balloons held at the buzzer (0 = downed at time).
+    const pops = document.createElement('span');
+    pops.className = 'text-sm font-bold tabular-nums text-amber-300';
+    pops.textContent = '★' + (r.score || 0);
+    row.appendChild(pops);
 
     const tally = document.createElement('span');
     tally.className = 'w-14 text-right text-base font-bold tabular-nums';
@@ -506,16 +504,15 @@ export class ResultsScreen {
     const list = Array.isArray(results) ? results : [];
     const me = list.find((r) => r.isPlayer);
     if (me) {
-      const kos = me.score || 0;
-      // Score race: placing is by pops, not survival — everyone respawns.
+      const pops = me.score || 0;
       this._summary.textContent =
         'You placed ' + this._ordinal(me.place) +
-        ' · ' + kos + ' pop' + (kos === 1 ? '' : 's');
+        ' · ' + pops + ' pop' + (pops === 1 ? '' : 's');
     } else {
       this._summary.textContent = 'Battle complete';
     }
 
-    // Headline: a gold VICTORY! when the player tops the board (most pops), else BATTLE OVER.
+    // Headline: a gold VICTORY! when the player tops the board, else BATTLE OVER.
     const won = !!(me && me.place === 1);
     this._title.textContent = won ? 'VICTORY!' : 'BATTLE OVER';
     this._title.className = won ? this._titleClassVictory : this._titleClassBase;

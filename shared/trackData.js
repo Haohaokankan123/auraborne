@@ -387,10 +387,10 @@ export const TRACKS = {
     // [0.72,0.78] is the fast, gently-left OPEN back sweep (control pts 20-23): the
     // nearest features are the airtime ramp at 0.70 (landed by 0.72) and the
     // switchback cone at 0.79 — so this window contains NO ramp/gap/boost/hazard.
-    // A single 360° revolution: roll(startU)=0 and roll(endU)=2π≡0 (smootherstep
+    // A TRIPLE 1080° barrel roll: roll(startU)=0 and roll(endU)=6π≡0 (smootherstep
     // gives zero roll-RATE at both ends), so the section blends seamlessly into the
-    // normal road and the kart exits upright.
-    antigrav: [{ startU: 0.72, endU: 0.78, revolutions: 1 }],
+    // normal road and the kart exits upright — triple the spin, same clean entry/exit.
+    antigrav: [{ startU: 0.72, endU: 0.78, revolutions: 3 }],
     // Control points. y is ABSOLUTE world height (elevation baked in). MAX-SPECTACLE
     // COASTER REBUILD: the XZ layout is UNCHANGED (every corner/apex + the AI
     // corner-cut keep working), but `y` now swings VIOLENTLY — ~120m of total
@@ -412,10 +412,10 @@ export const TRACKS = {
       { x: 400, y:  56, z: -116 }, //      exit (bottom of the U), now heading back
       { x: 250, y:  78, z:  -98 }, // hairpin exit run, climbing steeply (boost ~0.14)
       { x: 148, y: 112, z:    8 }, // GLIDE-RAMP launch face (steep ramp up, ~0.24) — nudged NW so the climb clears the return run below
-      { x:  98, y: 150, z:   72 }, // SOARING onto the towering ridge — curved WEST so the climb peels off the return run below
-      { x: 190, y: 162, z:  140 }, // ---- S-CHICANE on the PEAK: kink right (~+102m)
-      { x: 150, y: 164, z:  205 }, //      crest, snap left (KNIFE-EDGE PEAK ~+104m) ----
-      { x:  60, y: 154, z:  215 }, //      chicane mid, opening left (still sky-high)
+      { x:  98, y: 164, z:   72 }, // SOARING onto the towering ridge — curved WEST so the climb peels off the return run below
+      { x: 190, y: 180, z:  140 }, // ---- S-CHICANE on the PEAK: kink right (~+120m)
+      { x: 150, y: 184, z:  205 }, //      crest, snap left (KNIFE-EDGE PEAK ~+124m) ----
+      { x:  60, y: 170, z:  215 }, //      chicane mid, opening left (still sky-high)
       { x:  -5, y: 124, z:  170 }, // chicane exit, ridge starts to fall hard (boost ~0.38)
       { x: -55, y:  92, z:   85 }, // running left along the ridge shoulder, dropping
       { x: -95, y:  72, z:    0 }, // STEEP PLUNGE off the ridge — near free-fall begins
@@ -483,12 +483,19 @@ export const TRACKS = {
     checkpointCount: 30,
     startU: 0.0,
     // ---- ANTI-GRAV (MK8-style wall/ceiling riding) — same data-driven flag as circuit ----
-    // A single 360° corkscrew on the fast turn-1-exit straight. [0.24,0.31] sits BETWEEN
-    // the oil hazards at 0.22 and 0.34, so the window holds NO ramp/gap/boost/hazard.
-    // roll(startU)=0 and roll(endU)=2π≡0 (smootherstep => zero roll-RATE at both ends),
-    // so it blends seamlessly into the road and the kart exits upright. Read purely by
-    // antigravAt/surfaceFrameAt/updateAntigravTransition — no code change needed.
-    antigrav: [{ startU: 0.24, endU: 0.31, revolutions: 1 }],
+    // TWO corkscrews — the most spectacle of the three courses:
+    //  1. A TRIPLE 1080° wormhole on the fast turn-1-exit straight. [0.24,0.31] sits
+    //     BETWEEN the oil hazards at 0.22 and 0.34, so the window holds NO feature.
+    //  2. A DOUBLE 720° barrel on the dead-straight chicane->hairpin climbing link
+    //     [0.45,0.51] (measured maxBank 0.019 — essentially straight), between the
+    //     chicane-exit boost at 0.43 and the hairpin cone at 0.53.
+    // Each: roll(startU)=0 and roll(endU)=2π*rev≡0 (smootherstep => zero roll-RATE at
+    // both ends), so both blend seamlessly into the road and the kart exits upright.
+    // Read purely by antigravAt/surfaceFrameAt/updateAntigravTransition — no code change.
+    antigrav: [
+      { startU: 0.24, endU: 0.31, revolutions: 3 },
+      { startU: 0.45, endU: 0.51, revolutions: 2 },
+    ],
     // XZ scaled large for a fast ~3500m lap (UNCHANGED). MAX-SPECTACLE COASTER REBUILD:
     // `y` now rolls HARD — ~100m of verticality (50..150) instead of the old 58..118.
     // A long opening climb ROCKETS over a BIG rolling hill (~+74m) that blind-crests
@@ -501,9 +508,9 @@ export const TRACKS = {
     path: [
       { x:   0, y:  50, z: -470 }, // start straight (low base)
       { x: 200, y:  84, z: -450 }, // long opening straight — climbing HARD
-      { x: 380, y: 124, z: -380 }, // BIG ROLLING HILL crest (~+74m, blind into turn 1)
-      { x: 485, y: 132, z: -225 }, // crest top of the hill (~+82m)
-      { x: 515, y: 100, z:  -40 }, // long plunge off the hill
+      { x: 380, y: 140, z: -380 }, // BIG ROLLING HILL crest (~+90m, blind into turn 1)
+      { x: 485, y: 150, z: -225 }, // crest top of the hill (~+100m)
+      { x: 515, y: 104, z:  -40 }, // long plunge off the hill
       { x: 470, y:  74, z:  140 }, // rolling down toward the chicane bowl
       { x: 370, y:  60, z:  300 }, // dropping into the deep low bowl
       { x: 215, y:  52, z:  400 }, // sweeping down toward the chicane (deep low point)
@@ -572,13 +579,19 @@ export const TRACKS = {
     checkpointCount: 34,
     startU: 0.0,
     // ---- ANTI-GRAV (MK8-style wall/ceiling riding) — same data-driven flag as circuit ----
-    // A single 360° corkscrew on the climbing approach to T1. [0.12,0.19] sits BETWEEN
-    // the cone at 0.10 and the glide-ramp at 0.20, and is well clear of the figure-8
-    // crossing, so the window holds NO ramp/gap/boost/hazard. roll(startU)=0 and
-    // roll(endU)=2π≡0 (smootherstep => zero roll-RATE at both ends), so it blends
-    // seamlessly into the road and the kart exits upright. Read purely by
-    // antigravAt/surfaceFrameAt/updateAntigravTransition — no code change needed.
-    antigrav: [{ startU: 0.12, endU: 0.19, revolutions: 1 }],
+    // TWO corkscrews:
+    //  1. A DOUBLE 720° on the climbing approach to T1. [0.12,0.19] sits BETWEEN the
+    //     cone at 0.10 and the glide-ramp at 0.20, clear of the figure-8 crossing.
+    //  2. A DOUBLE 720° barrel ROUND THE WIDE CLOUD HAIRPIN [0.40,0.45] (measured
+    //     maxBank 0.043 — the gentlest window on the course; the hairpin is a wide
+    //     ~35m sweeper), between the hairpin cone at 0.38 and the exit boost at 0.47.
+    // Each: roll(startU)=0 and roll(endU)=4π≡0 (smootherstep => zero roll-RATE at both
+    // ends), so both blend seamlessly into the road and the kart exits upright. Read
+    // purely by antigravAt/surfaceFrameAt/updateAntigravTransition — no code change.
+    antigrav: [
+      { startU: 0.12, endU: 0.19, revolutions: 2 },
+      { startU: 0.40, endU: 0.45, revolutions: 2 },
+    ],
     // Twistiest course: XZ scaled large for a ~3400m technical lap (UNCHANGED).
     // MAX-SPECTACLE COASTER REBUILD: `y` is now the MOST EXTREME of the three —
     // ~125m of verticality (52..177) instead of the old 58..143. A GLIDE RAMP rockets
@@ -598,11 +611,11 @@ export const TRACKS = {
       { x:  211, y:  62, z: -431 }, // T1 approach, climbing
       { x:  301, y:  80, z: -384 }, // ---- TURN 1 (sweeping right), climbing
       { x:  378, y: 106, z: -321 }, // climbing the right side
-      { x:  439, y: 138, z: -245 }, // GLIDE-RAMP launch face (steep, ~0.20)
-      { x:  481, y: 162, z: -159 }, // SOARING up toward the cloud
-      { x:  502, y: 176, z:  -67 }, // cloud peak approach
-      { x:  502, y: 177, z:   27 }, // CLOUD PEAK (~+125m, by far the highest point of all)
-      { x:  481, y: 150, z:  119 }, // SHARP PLUNGE off the peak — near free-fall begins
+      { x:  439, y: 140, z: -245 }, // GLIDE-RAMP launch face (steep, ~0.20)
+      { x:  481, y: 170, z: -159 }, // SOARING up toward the cloud
+      { x:  502, y: 192, z:  -67 }, // cloud peak approach
+      { x:  502, y: 196, z:   27 }, // CLOUD PEAK (~+144m, by far the highest point of all)
+      { x:  481, y: 158, z:  119 }, // SHARP PLUNGE off the peak — near free-fall begins
       { x:  439, y: 108, z:  205 }, // plunge bottoming out (steep ~85m drop, oil ~0.32)
       { x:  403, y:  84, z:  304 }, // descending toward the hairpin (cone ~0.38)
       { x:  380, y:  74, z:  453 }, // ---- RIGHT HAIRPIN entry (pokes far OUT, top of loop)

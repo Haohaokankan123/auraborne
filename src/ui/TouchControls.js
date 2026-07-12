@@ -198,6 +198,20 @@ export class TouchControls {
       fontSize: '16px',
     });
 
+    // PAUSE: a small round button in the TOP-right corner (away from the driving
+    // thumbs). Without it a touch-only player is trapped in a race — no way to
+    // reach the pause menu / settings / quit until the race ends. It's a TAP (not
+    // a held control): it fires a global 'touchpause' event that main.js handles
+    // with the exact same logic as the keyboard Esc/P, so behaviour is identical.
+    this.btnPause = makeButton('pause', '⏸', 'rgba(20,22,30,0.72)', {
+      top: '20px',
+      right: '20px',
+      bottom: 'auto',
+      width: '56px',
+      height: '56px',
+      fontSize: '22px',
+    });
+
     // Quick lookups used when a touch starts on a button.
     this._buttons = [this.btnThrottle, this.btnBrake, this.btnDrift, this.btnItem, this.btnOverdrive];
 
@@ -231,7 +245,14 @@ export class TouchControls {
       const target = touch.target;
       const role = target && target.dataset ? target.dataset.role : null;
 
-      if (role === 'steer') {
+      if (role === 'pause') {
+        // A tap, not a held control: flash it and fire the global pause toggle.
+        // main.js listens for 'touchpause' and runs the same path as keyboard Esc.
+        this._setButtonPressedStyle(target, true);
+        setTimeout(() => this._setButtonPressedStyle(target, false), 120);
+        window.dispatchEvent(new CustomEvent('touchpause'));
+        handled = true;
+      } else if (role === 'steer') {
         // Claim the steer pad for this finger and remember its centre x so we
         // can measure left/right drag distance from it.
         this._steerTouchId = touch.identifier;

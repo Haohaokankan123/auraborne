@@ -71,7 +71,7 @@ import { getItem } from '../items/items.js'; // resolve the snapshot's held-item
 // than the snapshot interval (~1/20 = 50ms) so there are almost always two
 // snapshots straddling the render time to interpolate between. 100ms is a
 // common, comfortable default for a 20Hz snapshot stream.
-const INTERP_DELAY = 0.1;
+export const INTERP_DELAY = 0.1;
 
 // CONNECTION WATCHDOG: the server streams snapshots ~20Hz (every ~50ms). If they
 // stop arriving for this long mid-race the link is effectively dead — the
@@ -1015,7 +1015,7 @@ class Predictor {
 // + (shortest-arc) heading between them, copying through the discrete FX fields
 // (drifting tier, timers) from the newer one so the remote kart still shows
 // drift sparks / star flash / shrink correctly.
-class Interpolator {
+export class Interpolator {
   constructor() {
     // id -> array of { t, state } sorted by t ascending.
     this.buffers = new Map();
@@ -1110,7 +1110,7 @@ class Interpolator {
  * @param {Object} ks  snapshot.karts[i]
  * @returns {Object} a kart-state-shaped plain object.
  */
-function snapshotToState(ks) {
+export function snapshotToState(ks) {
   return {
     x: ks.x || 0,
     y: ks.y || 0,

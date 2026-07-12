@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<!-- Lock zoom/scroll so touching/tilting never pinch-zooms or scrolls the page. -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Kart Controller</title>
+<!-- socket.io client, served by the game server itself (no bundling). -->
+<script src="/socket.io/socket.io.js"></script>
+<style>
+  :root { --fuchsia: #e935c1; --cyan: #21d4fd; --gold: #ffe08a; --go: #7dffb0; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none; touch-action: none; }
+  html, body { margin: 0; height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+  body { background: radial-gradient(120% 100% at 50% 0%, #1a0b2e 0%, #0a0a17 70%); color: #fff; height: 100dvh; }
+  .fill { position: fixed; inset: 0; }
+  .center { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1.1rem; text-align: center; padding: 1.5rem; }
+
+  /* ---------- JOIN gate ---------- */
+  #join h1 { font-size: 2rem; font-weight: 900; letter-spacing: .04em; margin: 0;
+    text-shadow: 0 0 20px rgba(233,53,193,.6), 0 0 44px rgba(33,212,253,.35); }
+  #join p { color: #b9b3d0; margin: 0; font-size: .95rem; max-width: 21rem; }
+  #name { width: min(80vw, 18rem); padding: .8rem 1rem; border-radius: 1rem; border: 1px solid rgba(255,255,255,.15);
+    background: rgba(255,255,255,.06); color: #fff; font-size: 1.1rem; text-align: center; }
+  #name::placeholder { color: #8a84a3; }
+  .cta { padding: 1.1rem 2.2rem; border: none; border-radius: 1.4rem; font-size: 1.3rem; font-weight: 900;
+    letter-spacing: .05em; color: #fff; background: linear-gradient(90deg, var(--fuchsia), var(--cyan));
+    box-shadow: 0 10px 34px -8px rgba(233,53,193,.6); transition: transform .1s; }
+  .cta:active { transform: scale(.96); }
+  /* Control-mode chooser on the join screen. */
+  #modePick { display: flex; gap: .6rem; }
+  .modeOpt { padding: .6rem 1.1rem; border-radius: 1rem; font-weight: 800; font-size: .9rem; color: #cfc9e6;
+    background: rgba(255,255,255,.06); border: 2px solid rgba(255,255,255,.12); }
+  .modeOpt.sel { color: #fff; border-color: var(--cyan); background: rgba(33,212,253,.14); box-shadow: 0 0 18px rgba(33,212,253,.3); }
+  #hint { color: #7d7799; font-size: .78rem; max-width: 22rem; }
+
+  /* ---------- PAD (after join) ---------- */
+  #pad { display: none; }
+  #status { position: fixed; top: 0; left: 0; right: 0; height: 2.9rem; display: flex; align-items: center; gap: .5rem;
+    padding: 0 .9rem; font-size: .85rem; color: #cfc9e6; background: rgba(0,0,0,.28); z-index: 6; }
+  #dot { width: .8rem; height: .8rem; border-radius: 3px; box-shadow: 0 0 8px currentColor; background: #888; }
+  #race { margin-left: .6rem; font-weight: 800; color: var(--gold); font-variant-numeric: tabular-nums; letter-spacing: .02em; }
+  #modeBtn { margin-left: auto; padding: .25rem .7rem; border-radius: 999px; font-weight: 800; font-size: .72rem;
+    letter-spacing: .06em; color: #cfc9e6; background: rgba(255,255,255,.09); border: 1px solid rgba(255,255,255,.16); }
+  #conn { color: #7ee0a0; font-weight: 700; margin-left: .5rem; }
+
+  /* Item zone = the whole play area; tap anywhere NOT on the pedal/wheel to use an item. */
+  #itemZone { position: fixed; top: 2.9rem; left: 0; right: 0; bottom: 0; z-index: 1;
+    display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: .5rem; padding-top: .7rem; }
+  #itemZone.flash { background: radial-gradient(50% 40% at 50% 30%, rgba(33,212,253,.3), transparent 70%); }
+  /* Three item slots (like Grand Prix). */
+  #slots { display: flex; gap: .5rem; }
+  .slot { width: 3.1rem; height: 3.1rem; border-radius: .8rem; display: flex; align-items: center; justify-content: center;
+    font-size: 1.7rem; background: rgba(255,255,255,.05); border: 2px solid rgba(255,255,255,.12); transition: all .15s; }
+  .slot.filled { background: rgba(255,224,138,.16); border-color: rgba(255,224,138,.5); box-shadow: 0 0 16px rgba(255,224,138,.35); }
+  #useHint { font-size: .82rem; font-weight: 800; letter-spacing: .06em; color: #7d7799; transition: color .2s; }
+  #useHint.armed { color: var(--gold); text-shadow: 0 0 14px rgba(255,224,138,.5); }
+
+  /* ---------- GAS PEDAL (bottom-left) ---------- */
+  #gas { position: fixed; left: 1.1rem; bottom: 1.1rem; width: 8.5rem; height: 12rem; z-index: 4;
+    border: none; padding: 0; background: transparent; }
+  #gas .pedal { width: 100%; height: 100%; border-radius: 1.5rem 1.5rem 1.2rem 1.2rem;
+    background:
+      repeating-linear-gradient(0deg, rgba(255,255,255,.06) 0 3px, transparent 3px 13px),
+      linear-gradient(160deg, #2b2f3a 0%, #171922 60%, #0e0f16 100%);
+    border: 2px solid rgba(255,255,255,.14); box-shadow: 0 12px 26px -8px rgba(0,0,0,.7), inset 0 2px 0 rgba(255,255,255,.14);
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .35rem;
+    transition: transform .08s ease-out, box-shadow .08s, background .12s; }
+  #gas .ped-ic { font-size: 2.2rem; filter: drop-shadow(0 2px 3px rgba(0,0,0,.6)); }
+  #gas .ped-tx { font-weight: 900; font-size: .95rem; letter-spacing: .12em; color: #cfc9e6; }
+  #gas.on .pedal { transform: translateY(6px) scale(.97);
+    background:
+      repeating-linear-gradient(0deg, rgba(125,255,176,.1) 0 3px, transparent 3px 13px),
+      linear-gradient(160deg, #1c3a2a 0%, #12261c 60%, #0c1712 100%);
+    border-color: rgba(125,255,176,.6); box-shadow: 0 4px 12px -4px rgba(0,0,0,.7), 0 0 26px rgba(125,255,176,.45), inset 0 2px 0 rgba(255,255,255,.1); }
+  #gas.on .ped-tx { color: var(--go); }
+
+  /* ---------- STEERING WHEEL (bottom-right, draggable) ---------- */
+  #wheelWrap { position: fixed; right: 1.1rem; bottom: 1.1rem; width: 13rem; height: 13rem; z-index: 4;
+    display: flex; align-items: center; justify-content: center; }
+  #wheel { width: 100%; height: 100%; border-radius: 50%; position: relative; transition: transform .06s linear;
+    background:
+      radial-gradient(circle at 50% 42%, rgba(255,255,255,.10), transparent 55%),
+      conic-gradient(from 0deg, #1a1c24, #2a2d38, #1a1c24, #2a2d38, #1a1c24);
+    border: 3px solid rgba(255,255,255,.16); box-shadow: 0 12px 30px -8px rgba(0,0,0,.7), inset 0 0 0 10px rgba(0,0,0,.35), inset 0 0 40px rgba(0,0,0,.5); }
+  /* Grip notches around the rim. */
+  #wheel::before { content: ''; position: absolute; inset: 4px; border-radius: 50%;
+    background: repeating-conic-gradient(from 0deg, transparent 0 8deg, rgba(0,0,0,.35) 8deg 10deg); -webkit-mask: radial-gradient(circle, transparent 60%, #000 62%); mask: radial-gradient(circle, transparent 60%, #000 62%); }
+  /* Center hub + spokes. */
+  #wheel .hub { position: absolute; left: 50%; top: 50%; width: 4.6rem; height: 4.6rem; transform: translate(-50%,-50%);
+    border-radius: 50%; background: linear-gradient(160deg, #33camp 0%, #23252f 100%); background: linear-gradient(160deg, #2c2f3a, #1a1c24);
+    border: 2px solid rgba(255,255,255,.14); display: flex; align-items: center; justify-content: center; box-shadow: inset 0 2px 4px rgba(255,255,255,.1); }
+  #wheel .hub-ic { font-size: 1.5rem; filter: drop-shadow(0 1px 2px rgba(0,0,0,.6)); }
+  #wheel .spoke { position: absolute; left: 50%; top: 50%; width: .8rem; height: 50%; background: linear-gradient(#2c2f3a,#1a1c24); transform-origin: top center; }
+  #wheel .top-mark { position: absolute; left: 50%; top: 5%; width: .55rem; height: 1.4rem; margin-left: -.275rem; border-radius: 999px;
+    background: linear-gradient(var(--cyan), var(--fuchsia)); box-shadow: 0 0 12px rgba(33,212,253,.7); }
+  #wheelWrap .wlabel { position: absolute; bottom: -1.15rem; left: 0; right: 0; text-align: center; font-size: .7rem; font-weight: 800; letter-spacing: .1em; color: #7d7799; }
+
+  /* ---------- TILT-mode extras ---------- */
+  #tiltUI { position: fixed; left: 0; right: 0; bottom: 1.1rem; display: none; flex-direction: column; align-items: center; gap: .5rem; z-index: 4; pointer-events: none; }
+  #tiltUI.show { display: flex; }
+  #steerBar { width: min(70vw, 22rem); height: .55rem; border-radius: 1rem; background: rgba(255,255,255,.1); position: relative; overflow: hidden; }
+  #steerFill { position: absolute; top: 0; bottom: 0; left: 50%; width: 0; background: linear-gradient(90deg, var(--fuchsia), var(--cyan)); }
+  #recenter { pointer-events: auto; padding: .5rem 1.2rem; border-radius: 1rem; border: 1px solid rgba(255,255,255,.14);
+    background: rgba(255,255,255,.08); color: #cfc9e6; font-weight: 800; font-size: .8rem; }
+
+  /* Damage flash + finish + landscape hint (unchanged). */
+  #hitFlash { position: fixed; inset: 0; pointer-events: none; opacity: 0; transition: opacity .12s ease-out; z-index: 15;
+    background: radial-gradient(85% 85% at 50% 50%, rgba(255,45,45,.5), transparent 74%); }
+  #finish { position: fixed; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center;
+    gap: .8rem; text-align: center; padding: 2rem; z-index: 25; background: radial-gradient(120% 100% at 50% 0%, #1a0b2e 0%, #06060f 72%); }
+  #finish .ftitle { font-size: 1.6rem; font-weight: 900; letter-spacing: .06em; text-shadow: 0 0 20px rgba(233,53,193,.6), 0 0 44px rgba(33,212,253,.35); }
+  #finishPlace { font-size: 4.5rem; font-weight: 900; line-height: 1; color: var(--gold); text-shadow: 0 0 30px rgba(255,224,138,.55); }
+  #finish .fsub { color: #b9b3d0; font-size: .95rem; max-width: 18rem; }
+  #landscape { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; text-align: center;
+    background: #0a0a17; font-size: 1.1rem; color: #cfc9e6; padding: 2rem; z-index: 10; }
+</style>
+</head>
+<body>
+  <!-- JOIN GATE: the tap here also unlocks iOS motion permission (must be in a gesture). -->
+  <div id="join" class="fill center">
+    <h1>🏎️ YOUR KART</h1>
+    <p>Pick your controls, then jump in. Tap the item area to fire power-ups.</p>
+    <input id="name" type="text" maxlength="12" placeholder="Your name" autocomplete="off" />
+    <div id="modePick">
+      <div class="modeOpt sel" data-mode="touch">🎮 Touch<br><span style="font-weight:600;font-size:.72rem;opacity:.8">pedal + wheel</span></div>
+      <div class="modeOpt" data-mode="tilt">📱 Tilt<br><span style="font-weight:600;font-size:.72rem;opacity:.8">rotate phone</span></div>
+    </div>
+    <button id="joinBtn" class="cta">TAP TO PLAY</button>
+    <div id="hint">Hold your phone sideways (landscape). You can switch controls anytime with the button up top.</div>
+  </div>
+
+  <!-- CONTROLLER PAD -->
+  <div id="pad" class="fill">
+    <div id="status">
+      <span id="dot"></span><span id="who">—</span><span id="race"></span>
+      <button id="modeBtn">🎮 TOUCH</button><span id="conn">●</span>
+    </div>
+
+    <!-- Item area: tap anywhere here (not on the pedal/wheel) to use an item. -->
+    <div id="itemZone">
+      <div id="slots"><div class="slot"></div><div class="slot"></div><div class="slot"></div></div>
+      <div id="useHint">TAP TO USE ITEM</div>
+    </div>
+
+    <!-- GAS pedal (touch mode) -->
+    <button id="gas"><div class="pedal"><div class="ped-ic">⛽</div><div class="ped-tx">GAS</div></div></button>
+
+    <!-- STEERING wheel (touch mode) -->
+    <div id="wheelWrap">
+      <div id="wheel">
+        <div class="top-mark"></div>
+        <div class="hub"><div class="hub-ic">🏎️</div></div>
+      </div>
+      <div class="wlabel">DRAG TO STEER</div>
+    </div>
+
+    <!-- Tilt-mode UI -->
+    <div id="tiltUI">
+      <div id="steerBar"><div id="steerFill"></div></div>
+      <button id="recenter">RE-CENTER</button>
+    </div>
+  </div>
+
+  <div id="hitFlash"></div>
+
+  <div id="finish">
+    <div class="ftitle">🏁 FINISH</div>
+    <div id="finishPlace">—</div>
+    <div class="fsub">Look at the TV — the host can press <b>RACE AGAIN</b>!</div>
+  </div>
+
+  <div id="landscape">📱 Turn your phone sideways (landscape) to play.</div>
+
+  <script type="module" src="./controller.js"></script>
+</body>
+</html>

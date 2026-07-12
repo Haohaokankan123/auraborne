@@ -1648,4 +1648,27 @@ export class Kart {
       this.group.scale.setScalar(targetScale);
     }
   }
+
+  /**
+   * Free this kart's GPU resources and detach it from the scene. Each kart builds
+   * ~19 UNIQUE materials (chassis/driver/wheels/glow/glider/sparks) that nothing
+   * else shares, so a 13-kart field leaked ~250 materials on every race restart.
+   * We dispose ONLY the materials: the geometries are shared per-archetype caches
+   * (_geoCache/_driverGeoCache) and the textures are shared singletons
+   * (_sparkTexture/_contactShadowTexture) reused by future karts — disposing either
+   * would corrupt the next race. (three's Material.dispose() does NOT free the
+   * material's textures, which is exactly what we want here.)
+   */
+  dispose() {
+    const seen = new Set();
+    const one = (m) => {
+      if (m && !seen.has(m) && typeof m.dispose === 'function') { seen.add(m); m.dispose(); }
+    };
+    this.group.traverse((o) => {
+      const mat = o.material;
+      if (Array.isArray(mat)) mat.forEach(one);
+      else one(mat);
+    });
+    if (this.group.parent) this.group.parent.remove(this.group);
+  }
 }
