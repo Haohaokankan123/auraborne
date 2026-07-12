@@ -94,12 +94,16 @@ const DEFAULT_PROFILE = {
 //   nervous cautious, brakes early, hesitates on items, bobbles often (back-marker).
 //   drifter lives in the drift, chains mini-turbos, slightly risky lines.
 //   clean   smooth + defensive — no mistakes, holds traps, plays it safe.
+// Bumped across the board for a BRUTAL, FAST, SHARP field (Charles): higher aggression
+// (more proactive, well-aimed item use), fewer bobbles (lower mistakeRate) and quicker
+// reactions (lower reactionLag) so even the back-markers are crisp. pace/cornerSkill keep
+// the archetype spread so the field still strings out instead of driving as one block.
 export const PERSONALITIES = {
-  ace:     { pace: 1.16, aggression: 0.85, cornerSkill: 0.98, driftSkill: 0.90, mistakeRate: 0.00, reactionLag: 0.03 },
-  brawler: { pace: 1.08, aggression: 1.00, cornerSkill: 0.82, driftSkill: 0.60, mistakeRate: 0.10, reactionLag: 0.10 },
-  nervous: { pace: 0.98, aggression: 0.30, cornerSkill: 0.66, driftSkill: 0.20, mistakeRate: 0.15, reactionLag: 0.22 },
-  drifter: { pace: 1.10, aggression: 0.70, cornerSkill: 0.90, driftSkill: 1.00, mistakeRate: 0.05, reactionLag: 0.06 },
-  clean:   { pace: 1.06, aggression: 0.50, cornerSkill: 0.95, driftSkill: 0.70, mistakeRate: 0.00, reactionLag: 0.05 },
+  ace:     { pace: 1.18, aggression: 0.95, cornerSkill: 0.99, driftSkill: 0.92, mistakeRate: 0.00, reactionLag: 0.02 },
+  brawler: { pace: 1.10, aggression: 1.00, cornerSkill: 0.85, driftSkill: 0.65, mistakeRate: 0.06, reactionLag: 0.06 },
+  nervous: { pace: 1.00, aggression: 0.45, cornerSkill: 0.70, driftSkill: 0.25, mistakeRate: 0.10, reactionLag: 0.15 },
+  drifter: { pace: 1.12, aggression: 0.85, cornerSkill: 0.92, driftSkill: 1.00, mistakeRate: 0.03, reactionLag: 0.04 },
+  clean:   { pace: 1.08, aggression: 0.70, cornerSkill: 0.96, driftSkill: 0.72, mistakeRate: 0.00, reactionLag: 0.03 },
 };
 
 // Which archetype each grid slot gets (0 = pole). Front of the grid is stacked
@@ -120,10 +124,15 @@ const ARCHETYPE_ORDER = [
 // being uncatchable. cornerMult/aggrMult trim those traits at easier settings;
 // mistakeMult/lagMult scale the MISTAKE channels (easy bobbles far more; hard a
 // little LESS than its base, so the front-runners are genuinely sharp).
+// HARD is now genuinely BRUTAL: faster top end (factor 1.12), near-zero bobbles and
+// minimal reaction lag, full aggression — the front cars hound the player relentlessly.
+// MEDIUM is sharpened to a real challenge; EASY stays clearly beatable (still cruises
+// below the player's base and bobbles often) so the difficulty ladder still means
+// something and beginners can win.
 const DIFFICULTY = {
-  easy:   { factor: 0.82, cornerMult: 0.82, aggrMult: 0.70, mistakeMult: 1.80, lagMult: 1.60 },
-  medium: { factor: 0.93, cornerMult: 0.93, aggrMult: 0.90, mistakeMult: 1.30, lagMult: 1.25 },
-  hard:   { factor: 1.06, cornerMult: 1.00, aggrMult: 1.00, mistakeMult: 0.80, lagMult: 0.85 },
+  easy:   { factor: 0.86, cornerMult: 0.84, aggrMult: 0.80, mistakeMult: 1.60, lagMult: 1.50 },
+  medium: { factor: 0.97, cornerMult: 0.95, aggrMult: 1.00, mistakeMult: 1.00, lagMult: 1.00 },
+  hard:   { factor: 1.12, cornerMult: 1.00, aggrMult: 1.15, mistakeMult: 0.45, lagMult: 0.55 },
 };
 
 // --- CC LADDER (the "engine class" the player picks). ----------------------
@@ -222,8 +231,10 @@ const FORWARD_ITEMS = new Set(['greenShell', 'redShell', 'tripleGreen', 'tripleR
 const DEFENSIVE_ITEMS = new Set(['banana', 'tripleBanana', 'fakeBox', 'bobOmb']);
 const BOOST_ITEMS = new Set(['mushroom', 'tripleMushroom', 'goldenMushroom', 'star', 'boo']);
 // Progress gaps (meters) inside which a rival counts as "in range" to attack/defend.
-const ITEM_FWD_RANGE = 28; // fire a forward shell when the kart ahead is this close
-const ITEM_DEF_RANGE = 22; // drop a trap when the kart behind is this close
+// Widened for the more aggressive field — AIs fire shells from further back and guard
+// against chasers sooner, so power-ups are weaponised constantly instead of hoarded.
+const ITEM_FWD_RANGE = 36; // fire a forward shell when the kart ahead is this close
+const ITEM_DEF_RANGE = 28; // drop a trap when the kart behind is this close
 
 export class AIRacer {
   /**
@@ -250,7 +261,7 @@ export class AIRacer {
     // it into clean rising-edge pulses (the RaceManager fires once per edge, and
     // ItemSystem.useItem is a no-op when the slot is empty, so firing often is safe).
     this._itemCooldown = 0;
-    this._itemCooldownTime = 0.25 + (1 - this.profile.aggression) * 0.4;
+    this._itemCooldownTime = 0.18 + (1 - this.profile.aggression) * 0.3;
     // Anti-hoard fallback: how long the CURRENT item has been held. If a tactical
     // shot never lines up within ~4s, fire it anyway so AIs don't sit on items.
     this._heldId = null;

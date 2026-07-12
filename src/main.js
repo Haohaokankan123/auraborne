@@ -660,7 +660,9 @@ function startBattle() {
     selection: selection
       ? { stats: selection.stats, color: selection.color, name: selection.character && selection.character.name }
       : {},
-    fieldSize: 8,
+    // 12 karts (player + 11 bots) packed into the tighter battle arena: the density keeps
+    // the brawl frantic and is what lets the aggressive bots each rack up ~20-40 pops.
+    fieldSize: 12,
   });
   raceClock = 0;
   mode = 'battle';
